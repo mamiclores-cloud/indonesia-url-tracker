@@ -30,6 +30,8 @@ SELECT p.code, p.item_name, p.baseline_override_idr, p.high_cost_pct,
   COALESCE(SUM(CASE WHEN l.status='unchecked' THEN 1 ELSE 0 END),0) AS n_unchecked,
   COALESCE(SUM(CASE WHEN l.status_detail LIKE 'note conflict%' THEN 1 ELSE 0 END),0) AS n_conflict,
   MIN(CASE WHEN l.price_idr>0 THEN l.price_idr END) AS min_price,
+  MIN(CASE WHEN l.status='valid' AND COALESCE(l.last_price_idr,l.price_idr)>0
+        THEN COALESCE(l.last_price_idr,l.price_idr) END) AS min_valid_price,
   MAX(l.last_checked_at) AS last_checked
 FROM products p LEFT JOIN links l ON l.product_code=p.code AND l.active=1
 GROUP BY p.code ORDER BY p.code

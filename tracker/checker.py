@@ -88,8 +88,15 @@ def normalize_variant(s):
 SIZE_RE = re.compile(r"\d+\s*(?:ml|gr|g|gram|pcs|pc|sachet|kapsul|caps|l)\b", re.I)
 
 
-def match_variant(variant_text, models, url_model_id=None):
-    """Pick the model a sheet row refers to. Returns (model, how) or (None, reason)."""
+def match_variant(variant_text, models, url_model_id=None, allow_single_model=False):
+    """Pick the model a sheet row refers to. Returns (model, how) or (None, reason).
+
+    allow_single_model (finder only): accept a candidate that lists the product
+    as a single variant even when our variant_text doesn't match its name —
+    a single-option listing has nothing to choose, and our "variant" is often
+    just a quantity ("1pc") that other sellers don't model. Kept off for the
+    checker, where mismatching an existing link's variant would corrupt prices.
+    """
     if url_model_id is not None:
         for m in models:
             if m["model_id"] == url_model_id:
@@ -125,6 +132,14 @@ def match_variant(variant_text, models, url_model_id=None):
         hits = [m for m in models if tok and tok in normalize_variant(m["name"]).replace(" ", "")]
         if len(hits) == 1:
             return hits[0], f"size-token:{sizes[0]}"
+    # single-variant listing: accept it unless our size clearly conflicts
+    if allow_single_model and len(models) == 1:
+        our = SIZE_RE.search(vt.replace(" ", ""))
+        if our:
+            theirs = SIZE_RE.search((models[0]["name"] or "").replace(" ", ""))
+            if theirs and normalize_variant(theirs.group(0)) != normalize_variant(our.group(0)):
+                return None, f"single-model 尺寸不符：{theirs.group(0)} vs {our.group(0)}"
+        return models[0], "single-model-assumed"
     if url_model_id is not None:
         return None, f"display_model_id {url_model_id} 已不存在且規格文字比對失敗"
     return None, "規格文字無法對應任何選項"

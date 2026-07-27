@@ -24,6 +24,11 @@ SIZE_RE = re.compile(r"\d+\s*(?:ml|gr|g|gram|pcs|pc|sachet|l)\b", re.I)
 KEYWORD_CONFIRM_SIM = 0.78
 KEYWORD_CONFIRM_MIN = 2
 
+# Hard cap on PDP-confirm navigations per find run — bounds worst-case runtime
+# (each PDP is paced 3–8s). A product that can't be filled stops instead of
+# grinding through every location tier.
+MAX_PDP_CONFIRMS = 8
+
 
 def expand_find(params):
     codes = params.get("product_codes") or []
@@ -142,16 +147,23 @@ def run_find_links(job, item):
             src_title = parsed.get("title") or src_title
             src_brand = parsed.get("brand")
             model, _how = checker.match_variant(src["variant_text"], parsed["models"], src["model_id"])
+            # Reference = the SELECTED variant's own image (from tier_variations,
+            # verified to map correctly) PLUS the item cover(s). Candidate search
+            # thumbnails are covers, so the cover is what usually matches; the
+            # variant image guarantees we still represent OUR exact variant (and
+            # covers the case where the cover is a different variant or null).
+            # best_similarity takes the MAX, and exact-variant correctness is
+            # separately enforced at PDP confirm below.
             img_ids = []
             if model and model.get("image"):
                 img_ids.append(model["image"])
-            img_ids += (parsed.get("images") or [])[:1]
-            for iid in img_ids[:2]:
+            for im in (parsed.get("images") or [])[:2]:
+                if im and im not in img_ids:
+                    img_ids.append(im)
+            for iid in img_ids[:3]:
                 path = drv.fetch_image(iid)
                 if path:
-                    h = imagesim.dhash(path)
-                    hm = imagesim.dhash_mirrored(path)
-                    ref_hashes += [h, hm]
+                    ref_hashes += [imagesim.dhash(path), imagesim.dhash_mirrored(path)]
         else:
             keyword_only = True
 
@@ -162,6 +174,7 @@ def run_find_links(job, item):
 
     summary = {"attempts": [], "proposed": 0, "keyword_only": keyword_only}
     proposed = 0
+    pdp_confirms = 0        # bound total PDP navigations so a run can't drag on
 
     for attempt in (1, 2):
         kw = build_keyword(src_title, src_variant, attempt, brand=src_brand)
@@ -221,14 +234,17 @@ def run_find_links(job, item):
             tier_log["passed"] = len(cands)
 
             # --- PDP confirm best candidates until quota ------------------
-            for r in cands:
-                if proposed >= need:
+            # Only confirm the cheapest few per tier and cap the run total, so a
+            # product that can't be filled doesn't navigate dozens of PDPs.
+            for r in cands[:max(need * 3, 4)]:
+                if proposed >= need or pdp_confirms >= MAX_PDP_CONFIRMS:
                     break
                 url = linkparse.canonical_url(r["shopid"], r["itemid"])
+                pdp_confirms += 1
                 parsed, _ = drv.get_pdp(url)
                 if not parsed.get("exists") or parsed.get("unlisted"):
                     continue
-                model, how = checker.match_variant(src_variant, parsed["models"])
+                model, how = checker.match_variant(src_variant, parsed["models"], allow_single_model=True)
                 if model is None or not model.get("price_idr") or model.get("in_stock") is False:
                     continue
                 db.x("""INSERT INTO candidates(product_code, shopid, itemid, model_id, title,
@@ -243,12 +259,13 @@ def run_find_links(job, item):
                 seen_cand.add(f'{r["shopid"]}.{r["itemid"]}')
                 proposed += 1
 
-            if proposed >= need:
+            if proposed >= need or pdp_confirms >= MAX_PDP_CONFIRMS:
                 break
-        if proposed >= need or not keyword_bad:
+        if proposed >= need or pdp_confirms >= MAX_PDP_CONFIRMS or not keyword_bad:
             break
 
     summary["proposed"] = proposed
+    summary["pdp_confirms"] = pdp_confirms
     if proposed == 0:
         db.x("UPDATE products SET updated_at=? WHERE code=?", (db.now(), code))
         summary["note"] = ("關鍵字比對失敗，需人工設定關鍵字" if keyword_bad

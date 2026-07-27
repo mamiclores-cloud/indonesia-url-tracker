@@ -21,7 +21,7 @@
 <thead><tr>
   <th><input type="checkbox" onclick="toggleAll(this)"></th>
   <th>Product code</th><th>品名</th><th>連結</th><th>有效</th><th>問題</th>
-  <th>最低價 (IDR)</th><th>基準覆寫</th><th>最後檢查</th>
+  <th>最低價 (IDR)</th><th>基準價 (IDR)</th><th>最後檢查</th>
 </tr></thead>
 <tbody>
 {% for r in rows %}
@@ -38,7 +38,11 @@
     {% if r.n_unchecked %}<span class="tag">{{ r.n_unchecked }} 未查</span>{% endif %}
   </td>
   <td class="num">{{ '{:,}'.format(r.min_price) if r.min_price else '' }}</td>
-  <td class="num">{{ '{:,}'.format(r.baseline_override_idr) if r.baseline_override_idr else '自動' }}</td>
+  {% set eff = r.baseline_override_idr or r.min_valid_price %}
+  <td class="num">
+    {{ '{:,}'.format(eff) if eff else '—' }}
+    {% if r.baseline_override_idr %}<span class="tag" title="手動設定">手動</span>{% endif %}
+  </td>
   <td class="dim">{{ (r.last_checked or '')[:16] }}</td>
 </tr>
 {% endfor %}

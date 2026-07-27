@@ -27,12 +27,14 @@ DEFAULTS = {
     "chrome_path": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "chrome_debug_port": 9222,
     "pacing": {"min_delay_s": 3, "max_delay_s": 8, "long_pause_every": 25, "long_pause_s": 60},
+    # City-level names only — Shopee's location filter and shop_location fields
+    # are city-level, so region names like "Jabodetabek"/"Jawa Barat" match
+    # nothing and waste a whole tier. Ordered inner→outer from Jakarta; last
+    # tier is unfiltered (nationwide).
     "location_tiers": [
         ["Kota Tangerang", "Kab. Tangerang", "Kota Tangerang Selatan",
          "Jakarta Barat", "Jakarta Pusat", "Jakarta Selatan", "Jakarta Timur", "Jakarta Utara"],
-        ["Jabodetabek"],
-        ["DKI Jakarta", "Banten"],
-        ["Jawa Barat"],
+        ["Kota Bekasi", "Kab. Bekasi", "Kota Depok", "Kota Bogor", "Kab. Bogor", "Kota Tangerang Selatan"],
         []
     ],
     "search_locations_param": {},  # {"param": "locations"|"fe_filter_options", "value": str}

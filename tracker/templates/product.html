@@ -4,20 +4,27 @@
 <h1>{{ p.code }} <small>{{ p.item_name or '' }}</small></h1>
 
 <section class="card">
+  {% set eff = p.baseline_override_idr or auto_baseline %}
   <h2>基準成本</h2>
   <div class="row">
-    <label>自動基準（有效連結最低價）：<b>{{ '{:,}'.format(auto_baseline) if auto_baseline else '無有效連結' }}</b> IDR</label>
+    <label>目前基準價：<b>{{ '{:,}'.format(eff) if eff else '無有效連結' }}</b> IDR
+      {% if p.baseline_override_idr %}<span class="tag">手動設定</span>
+      {% elif auto_baseline %}<span class="tag">自動（有效連結最低價 {{ '{:,}'.format(auto_baseline) }}）</span>
+      {% endif %}
+    </label>
   </div>
   <div class="row">
-    <label>手動覆寫基準 (IDR)：
-      <input id="baseline" type="number" value="{{ p.baseline_override_idr or '' }}" placeholder="留空 = 自動">
+    <label>基準價 (IDR)：
+      <input id="baseline" type="number" value="{{ eff or '' }}" placeholder="留空 = 自動計算">
     </label>
     <label>high cost 門檻 X%：
       <input id="pct" type="number" step="0.5" value="{{ p.high_cost_pct if p.high_cost_pct is not none else '' }}"
              placeholder="全域 {{ global_pct }}%">
     </label>
-    <button onclick="saveBaseline()">儲存</button>
+    <button onclick="saveBaseline()">儲存為手動基準</button>
+    {% if p.baseline_override_idr %}<button class="warn" onclick="resetBaseline()">改回自動</button>{% endif %}
   </div>
+  <div class="row dim">手動基準會固定不變；「改回自動」則永遠取有效連結中的最低價當基準。high cost = 最新價 &gt; 基準價 ×(1 + X%)。</div>
   <div class="row">
     <button onclick="runJob('check')">檢查此商品連結</button>
     <button onclick="runJob('find')">為此商品找新連結</button>
@@ -89,6 +96,11 @@ async function saveBaseline() {
   const r = await api(`/api/products/${encodeURIComponent(CODE)}/baseline`, {
     baseline_override_idr: document.getElementById('baseline').value,
     high_cost_pct: document.getElementById('pct').value });
+  if (r.ok) location.reload();
+}
+async function resetBaseline() {
+  const r = await api(`/api/products/${encodeURIComponent(CODE)}/baseline`, {
+    baseline_override_idr: '' });
   if (r.ok) location.reload();
 }
 async function runJob(kind) {
