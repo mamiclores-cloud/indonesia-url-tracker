@@ -247,12 +247,16 @@ def run_find_links(job, item):
                 model, how = checker.match_variant(src_variant, parsed["models"], allow_single_model=True)
                 if model is None or not model.get("price_idr") or model.get("in_stock") is False:
                     continue
+                # D 欄：只有 1 個 model = 沒有可選規格 → "-"（SPEC：無選項顯示 -）；
+                # 內部 model 名（如空字串或「SKINTIFIC EYE CREAM」）不是使用者可選項目
+                n_models = len(parsed.get("models") or [])
+                variant_for_d = model["name"] if (n_models > 1 and (model.get("name") or "").strip()) else "-"
                 db.x("""INSERT INTO candidates(product_code, shopid, itemid, model_id, title,
                          variant_text, price_idr, sold, shop_name, shop_location, image_sim,
                          tier, state, note, created_at)
                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'proposed',?,?)""",
-                     (code, r["shopid"], r["itemid"], model["model_id"],
-                      parsed.get("title") or r["title"], model["name"], model["price_idr"],
+                     (code, r["shopid"], r["itemid"], model["model_id"] if n_models > 1 else None,
+                      parsed.get("title") or r["title"], variant_for_d, model["price_idr"],
                       r["sold"], parsed.get("shop_name") or "", r["shop_location"],
                       r.get("sim"), tier_idx,
                       "需人工確認（無圖片驗證）" if keyword_only else "", db.now()))
@@ -282,7 +286,8 @@ def accept_candidate(cand_id, job_id=None):
         return None
     url = linkparse.canonical_url(c["shopid"], c["itemid"], c["model_id"])
     payload = {
-        "url": url, "page_name": c["title"], "variant_text": c["variant_text"],
+        "url": url, "product_code": c["product_code"],
+        "page_name": c["title"], "variant_text": c["variant_text"],
         "price_idr": c["price_idr"], "supplier": c["shop_name"],
         "shopid": c["shopid"], "itemid": c["itemid"], "candidate_id": c["id"],
     }

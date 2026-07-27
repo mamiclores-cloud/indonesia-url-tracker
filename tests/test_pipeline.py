@@ -135,9 +135,13 @@ def main():
         {"itemid": 999004, "shopid": 555004, "title": "Other brand serum",
          "price_idr": 30000, "sold": 200, "image": "s4", "shop_location": "Surabaya", "is_ad": False},  # wrong loc
     ]
+    # multi-variant candidate → the matched model's id flows into the URL and
+    # the chosen variant name into D
     fake.pdp[999001] = {"exists": True, "unlisted": False, "title": "Skintific Low pH Cleanser 80ml murah",
                         "shop_name": "TokoMurah", "images": ["n1"], "item_status": "normal",
-                        "models": [{"model_id": 777, "name": "LOW PH 80ml,Skintific",
+                        "models": [{"model_id": 776, "name": "LOW PH 15ml MINI",
+                                    "price_idr": 30000, "stock": None, "in_stock": True, "image": "n0"},
+                                   {"model_id": 777, "name": "LOW PH 80ml,Skintific",
                                     "price_idr": 70000, "stock": None, "in_stock": True, "image": "n1a"}]}
 
     job_id = jobs.create_job("find", {"product_codes": [CODE]})
@@ -146,6 +150,7 @@ def main():
     cands = [dict(c) for c in db.q("SELECT * FROM candidates WHERE product_code=?", (CODE,))]
     assert len(cands) == 1, f"expected exactly 1 candidate: {[(c['itemid'], c['state']) for c in cands]}"
     assert cands[0]["itemid"] == 999001 and cands[0]["price_idr"] == 70000
+    assert cands[0]["variant_text"] == "LOW PH 80ml,Skintific", cands[0]["variant_text"]
     print("find pipeline OK: candidate", cands[0]["itemid"], "@", cands[0]["price_idr"], "IDR")
 
     # ---- accept → insert_link_row payload --------------------------------
@@ -154,8 +159,31 @@ def main():
     p = db.jload(w["payload_json"])
     assert w["kind"] == "insert_link_row" and w["dedupe_key"] == "555001.999001"
     assert p["price_idr"] == 70000 and p["supplier"] == "TokoMurah"
+    assert p["product_code"] == CODE, p.get("product_code")     # A 欄要填 product code
     assert "display_model_id%22%3A777" in p["url"]
     print("accept OK:", p["url"][:80])
+
+    # ---- single-variant candidate → D = "-", URL without display_model_id -
+    reset()
+    db.x("UPDATE links SET status='valid', last_price_idr=78000 WHERE product_code=? AND sheet_row_hint=25", (CODE,))
+    db.x("UPDATE links SET status='sold_out' WHERE product_code=? AND sheet_row_hint IN (26,27)", (CODE,))
+    fake.search_results = [
+        {"itemid": 888001, "shopid": 444001, "title": "Skintific cleanser single",
+         "price_idr": 68000, "sold": 3000, "image": "z1", "shop_location": "Jakarta Barat", "is_ad": False},
+    ]
+    fake.pdp[888001] = {"exists": True, "unlisted": False, "title": "Skintific Cleanser (no options)",
+                        "shop_name": "SoloShop", "images": ["z1"], "item_status": "normal",
+                        "models": [{"model_id": 900, "name": "SKINTIFIC CLEANSER",
+                                    "price_idr": 68000, "stock": None, "in_stock": True, "image": "z1a"}]}
+    job_id = jobs.create_job("find", {"product_codes": [CODE]})
+    run_job_to_completion(job_id)
+    c2 = dict(db.q1("SELECT * FROM candidates WHERE product_code=? AND itemid=888001", (CODE,)))
+    assert c2["variant_text"] == "-", f"single-model D should be '-': {c2['variant_text']!r}"
+    assert c2["model_id"] is None, c2["model_id"]
+    wid2 = finder.accept_candidate(c2["id"])
+    p2 = db.jload(dict(db.q1("SELECT * FROM pending_writes WHERE id=?", (wid2,)))["payload_json"])
+    assert "display_model_id" not in p2["url"], p2["url"]
+    print("single-variant OK: D='-', URL without display_model_id")
 
     reset()
     print("\nALL OFFLINE PIPELINE TESTS PASSED")

@@ -450,6 +450,9 @@ def apply_writes(write_ids, progress=None):
             r2 = sess.post(f"{base}/values:batchUpdate", json={
                 "valueInputOption": "USER_ENTERED",
                 "data": [
+                    # A 欄填上同樣的 product code（使用者要求：找到的新列也要標明所屬商品）
+                    {"range": f"{ws}!A{new_row}",
+                     "values": [[p.get("product_code", code)]]},
                     {"range": f"{ws}!C{new_row}:E{new_row}",
                      "values": [[p.get("page_name", ""), p.get("variant_text", ""), p.get("price_idr")]]},
                     {"range": f"{ws}!G{new_row}:H{new_row}",
