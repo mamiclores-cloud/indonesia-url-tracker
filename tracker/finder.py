@@ -23,6 +23,9 @@ SIZE_RE = re.compile(r"\d+\s*(?:ml|gr|g|gram|pcs|pc|sachet|l)\b", re.I)
 # hits in the top page; a wrong keyword yields at most one.
 KEYWORD_CONFIRM_SIM = 0.78
 KEYWORD_CONFIRM_MIN = 2
+# ...or this many title-matching results in the top page confirm the keyword —
+# more reliable than image similarity for multi-variant/scent product lines.
+KEYWORD_TITLE_MIN = 3
 
 # Hard cap on PDP-confirm navigations per find run — bounds worst-case runtime
 # (each PDP is paced 3–8s). A product that can't be filled stops instead of
@@ -104,19 +107,66 @@ def _location_ok(shop_location, tier):
     return any(t.lower() in loc or loc in t.lower() for t in tier if t)
 
 
+def _confirm_rank(r):
+    """PDP-confirm priority: higher image-similarity band first, cheapest (then
+    best-selling) within a band. Keeps SPEC's price priority among equally
+    likely matches while not wasting confirms on loose low-similarity items."""
+    sim = r.get("sim") or 0
+    band = 0 if sim >= 0.7 else 1 if sim >= 0.6 else 2 if sim >= 0.5 else 3
+    return (band, r["price_idr"], -(r["sold"] or 0))
+
+
+def _product_tokens(keyword, brand):
+    """Distinctive (len≥4, non-brand, non-size) product words from the keyword.
+    Used to reject same-brand-different-product results that the image gate
+    can't tell apart (e.g. Fresh Care 'Aromatherapy Roll On' vs 'Press & Relax').
+
+    Brand exclusion is fragment-aware: a brand written 'FRESHCARE' still drops
+    the 'fresh'/'care' tokens that a split 'Fresh Care' title yields."""
+    bnorm = checker.normalize_variant(brand).replace(" ", "") if brand else ""
+    out = []
+    for t in checker.normalize_variant(keyword).split():
+        if len(t) < 4 or SIZE_RE.fullmatch(t):
+            continue
+        if bnorm and (t in bnorm or bnorm in t):   # brand or a fragment of it
+            continue
+        out.append(t)
+    return out
+
+
+def _title_has_product(title, ptokens):
+    """True if the candidate title shares at least one distinctive product word.
+    Lenient (≥1) so terse genuine titles still pass, but enough to drop a
+    sibling product that shares only the brand name. Matches per word-token
+    (a product token may be a substring of a title token, e.g. roll⊂rollon)."""
+    if not ptokens:
+        return True
+    title_tokens = checker.normalize_variant(title).split()
+    return any(any(pt in tt for tt in title_tokens) for pt in ptokens)
+
+
 # ------------------------------------------------------------- pipeline ----
 
 def _source_link(code):
-    """Best row to extract keyword/image from: valid first, then recoverable."""
+    """Best row to extract keyword/image from.
+
+    Prefer ORIGINAL sheet links over auto-found ones: the human-curated sheet
+    row is the authoritative identity of the product, whereas a prior bad
+    auto-find (e.g. a keyword-only match with no image check) could seed the
+    keyword for the WRONG product and cascade. Within each origin, prefer the
+    healthiest status.
+    """
     order = {"valid": 0, "high_cost": 1, "sold_out": 2, "unlisted": 3}
     rows = [dict(r) for r in db.q(
         "SELECT * FROM links WHERE product_code=? AND active=1", (code,))]
     usable = [r for r in rows if r["status"] in order and r["dedupe_key"]]
-    usable.sort(key=lambda r: order[r["status"]])
+    usable.sort(key=lambda r: (0 if r["origin"] == "sheet" else 1, order[r["status"]]))
     if usable:
         return usable[0], False
-    # keyword-only mode: any row with C/D text
+    # keyword-only mode: any ORIGINAL sheet row with C/D text (avoid seeding
+    # from a found row); fall back to any text row if none.
     texty = [r for r in rows if (r["page_name"] or "").strip()]
+    texty.sort(key=lambda r: 0 if r["origin"] == "sheet" else 1)
     return (texty[0] if texty else None), True
 
 
@@ -182,6 +232,10 @@ def run_find_links(job, item):
         kw = build_keyword(src_title, src_variant, attempt, brand=src_brand)
         if not kw:
             continue
+        # distinctive tokens from the cleaned keyword, NOT the raw title (the raw
+        # title carries generic words like "minyak angin" that sibling products
+        # also have, which would let them slip through)
+        ptokens = _product_tokens(kw, src_brand)
         attempt_log = {"keyword": kw, "tiers": []}
         summary["attempts"].append(attempt_log)
         keyword_bad = False
@@ -198,32 +252,38 @@ def run_find_links(job, item):
                 tier_log["note"] = "location filter ineffective"
             pool = [r for r in results if _location_ok(r["shop_location"], tier)] if tier else results
 
-            # Two separate bars (calibrated on real KBT105 #1 data):
-            #  - inclusion (sim_threshold): keep a candidate for ranking; loose so
-            #    cheap genuine matches aren't dropped.
-            #  - confirm (KEYWORD_CONFIRM_SIM): "are we even looking at the right
-            #    product?" strict, needs a few near-identical hits in the top page;
-            #    unrelated goods rarely score this high, so this catches bad keywords.
+            # Product identity uses TWO signals; either one confirms the keyword
+            # is finding our product (image alone is unreliable for multi-scent
+            # lines whose variants differ from our reference photo):
+            #  - title gate: candidate title carries a distinctive product word
+            #    (stable, brand-siblings like Press&Relax fail it)
+            #  - image band (KEYWORD_CONFIRM_SIM): near-identical photo in top page
+            # A candidate is included only if it passes the title gate AND clears
+            # the (loose) image inclusion threshold; ranking then prefers the
+            # higher-similarity, cheaper ones.
             gated = []
             confirm_hits = 0
+            title_hits = 0
             for idx, r in enumerate(pool):
+                title_ok = _title_has_product(r["title"], ptokens)
+                if idx < 12 and title_ok:
+                    title_hits += 1
                 sim = None
                 if ref_hashes and r.get("image"):
                     path = drv.fetch_image(r["image"])
                     sim = imagesim.best_similarity(ref_hashes, imagesim.dhash(path)) if path else None
                 r["sim"] = sim
-                if ref_hashes:
-                    if idx < 12 and sim is not None and sim >= KEYWORD_CONFIRM_SIM:
-                        confirm_hits += 1
-                    if sim is not None and sim >= sim_threshold:
-                        gated.append(r)
-                else:
+                if idx < 12 and sim is not None and sim >= KEYWORD_CONFIRM_SIM:
+                    confirm_hits += 1
+                if title_ok and (not ref_hashes or (sim is not None and sim >= sim_threshold)):
                     gated.append(r)
-            if ref_hashes and confirm_hits < KEYWORD_CONFIRM_MIN and len(pool) >= 5:
-                # keyword likely wrong (SPEC: 相似度不足代表關鍵字錯誤)
+
+            keyword_ok = confirm_hits >= KEYWORD_CONFIRM_MIN or title_hits >= KEYWORD_TITLE_MIN
+            if not keyword_ok and len(pool) >= 5:
+                # search isn't returning our product (bad/too-generic keyword)
                 keyword_bad = True
-                tier_log["note"] = (f"keyword check: only {confirm_hits} near-identical "
-                                    f"(≥{KEYWORD_CONFIRM_SIM}) in top 12")
+                tier_log["note"] = (f"keyword check failed: image≥{KEYWORD_CONFIRM_SIM} "
+                                    f"hits={confirm_hits}, title hits={title_hits}")
                 break
 
             cands = [r for r in gated
@@ -232,7 +292,11 @@ def run_find_links(job, item):
                      and (r["sold"] or 0) >= min_sold
                      and r.get("price_idr")
                      and not r.get("is_sold_out")]
-            cands.sort(key=lambda r: (r["price_idr"], -(r["sold"] or 0)))
+            # Confirm order: by similarity band first (most-likely-genuine),
+            # cheapest within each band. A low inclusion threshold otherwise
+            # floods the pool with loose matches and the cheapest-first rule
+            # burns the PDP-confirm budget on junk before reaching real matches.
+            cands.sort(key=_confirm_rank)
             tier_log["passed"] = len(cands)
 
             # --- PDP confirm best candidates until quota ------------------
