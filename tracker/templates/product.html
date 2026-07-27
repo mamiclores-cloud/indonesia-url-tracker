@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}{{ p.code }}{% endblock %}
+{% block content %}
+<h1>{{ p.code }} <small>{{ p.item_name or '' }}</small></h1>
+
+<section class="card">
+  <h2>基準成本</h2>
+  <div class="row">
+    <label>自動基準（有效連結最低價）：<b>{{ '{:,}'.format(auto_baseline) if auto_baseline else '無有效連結' }}</b> IDR</label>
+  </div>
+  <div class="row">
+    <label>手動覆寫基準 (IDR)：
+      <input id="baseline" type="number" value="{{ p.baseline_override_idr or '' }}" placeholder="留空 = 自動">
+    </label>
+    <label>high cost 門檻 X%：
+      <input id="pct" type="number" step="0.5" value="{{ p.high_cost_pct if p.high_cost_pct is not none else '' }}"
+             placeholder="全域 {{ global_pct }}%">
+    </label>
+    <button onclick="saveBaseline()">儲存</button>
+  </div>
+  <div class="row">
+    <button onclick="runJob('check')">檢查此商品連結</button>
+    <button onclick="runJob('find')">為此商品找新連結</button>
+  </div>
+</section>
+
+<section class="card">
+<h2>連結（{{ links | selectattr('active') | list | length }} 條）</h2>
+<table>
+<thead><tr><th>列</th><th>標題 / 規格</th><th>賣場</th><th>表上價</th><th>最新價</th>
+<th>狀態</th><th>Note</th><th>最後檢查</th></tr></thead>
+<tbody>
+{% for l in links if l.active %}
+<tr>
+  <td class="dim">{{ l.sheet_row_hint or '' }}</td>
+  <td>
+    <a href="{{ l.canonical_url or l.raw_url }}" target="_blank">{{ (l.page_name or l.raw_url)[:70] }}</a>
+    <div class="dim">{{ l.variant_text or '' }}</div>
+  </td>
+  <td>{{ l.supplier or '' }}</td>
+  <td class="num">{{ '{:,}'.format(l.price_idr) if l.price_idr else '' }}</td>
+  <td class="num">{{ '{:,}'.format(l.last_price_idr) if l.last_price_idr else '' }}</td>
+  <td><span class="tag st-{{ l.status }}">{{ l.status }}</span>
+      <div class="dim">{{ l.status_detail or '' }}</div></td>
+  <td>{{ l.note or '' }}</td>
+  <td class="dim">{{ (l.last_checked_at or '')[:16] }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% set inactive = links | rejectattr('active') | list %}
+{% if inactive %}<p class="dim">另有 {{ inactive | length }} 條已從表上消失的連結（active=0）</p>{% endif %}
+</section>
+
+{% if cands %}
+<section class="card">
+<h2>候選新連結</h2>
+<table>
+<thead><tr><th>標題 / 規格</th><th>賣場</th><th>地區</th><th>價格</th><th>銷量</th>
+<th>相似度</th><th>狀態</th><th></th></tr></thead>
+<tbody>
+{% for c in cands %}
+<tr>
+  <td><a href="https://shopee.co.id/product/{{ c.shopid }}/{{ c.itemid }}" target="_blank">{{ (c.title or '')[:70] }}</a>
+      <div class="dim">{{ c.variant_text or '' }} {{ c.note or '' }}</div></td>
+  <td>{{ c.shop_name or '' }}</td>
+  <td>{{ c.shop_location or '' }}</td>
+  <td class="num">{{ '{:,}'.format(c.price_idr) if c.price_idr else '' }}</td>
+  <td class="num">{{ c.sold or 0 }}</td>
+  <td class="num">{{ '%.0f%%' % (c.image_sim * 100) if c.image_sim else '—' }}</td>
+  <td><span class="tag">{{ c.state }}</span></td>
+  <td>
+    {% if c.state == 'proposed' %}
+    <button onclick="cand({{ c.id }}, 'accept')">採用</button>
+    <button class="warn" onclick="cand({{ c.id }}, 'reject')">拒絕</button>
+    {% endif %}
+  </td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script>
+const CODE = {{ p.code | tojson }};
+async function saveBaseline() {
+  const r = await api(`/api/products/${encodeURIComponent(CODE)}/baseline`, {
+    baseline_override_idr: document.getElementById('baseline').value,
+    high_cost_pct: document.getElementById('pct').value });
+  if (r.ok) location.reload();
+}
+async function runJob(kind) {
+  const r = await api('/api/jobs', {kind, product_codes: [CODE]});
+  if (r.ok) location.href = '/jobs/' + r.job_id;
+}
+async function cand(id, action) {
+  const r = await api(`/api/candidates/${id}/${action}`, {});
+  if (r.ok) location.reload();
+}
+</script>
+{% endblock %}

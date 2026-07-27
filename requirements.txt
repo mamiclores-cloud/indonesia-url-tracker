@@ -1,0 +1,16 @@
+# 系統 Python 3.12 直接安裝（不要建 venv — Smart App Control 會擋 venv 內複製的原生 DLL）
+# 只有 openpyxl 需要另外裝，其餘在本機已存在；全部為純 Python 套件
+flask>=3.1
+gspread>=6.2
+# google-auth 必須 ==2.29.0：更新版本無條件 import cryptography（Rust 原生 DLL），
+# 會被 Smart App Control 封鎖；2.29.0 對 cryptography 是 optional（本專案只用 OAuth，用不到）
+google-auth==2.29.0
+google-auth-oauthlib>=1.2
+websocket-client>=1.8
+requests>=2.32
+Pillow>=10
+openpyxl>=3.1
+# 若 import 時出現「應用程式控制原則已封鎖此檔案」（charset_normalizer / markupsafe 的
+# 原生加速檔被擋），改用純 Python 版重裝：
+#   pip install --user --no-binary charset_normalizer charset_normalizer --force-reinstall
+#   pip install --user --no-binary markupsafe markupsafe --force-reinstall

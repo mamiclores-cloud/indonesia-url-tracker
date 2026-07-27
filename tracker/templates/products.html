@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>商品清單 <small>{{ total }} 筆</small></h1>
+<form class="toolbar" method="get" action="/products">
+  <input type="text" name="q" value="{{ q }}" placeholder="搜尋 product code / 品名">
+  <select name="filter">
+    <option value="">全部</option>
+    <option value="few_valid" {% if flt=='few_valid' %}selected{% endif %}>有效連結 ≤ 1</option>
+    <option value="bad" {% if flt=='bad' %}selected{% endif %}>有無效/售完/高價</option>
+    <option value="error" {% if flt=='error' %}selected{% endif %}>有錯誤</option>
+    <option value="conflict" {% if flt=='conflict' %}selected{% endif %}>note conflict</option>
+    <option value="unchecked" {% if flt=='unchecked' %}selected{% endif %}>未檢查</option>
+  </select>
+  <button>篩選</button>
+  <span class="spacer"></span>
+  <button type="button" onclick="checkSelected()">檢查勾選商品</button>
+  <button type="button" onclick="findSelected()">為勾選商品找連結</button>
+  <button type="button" class="warn" onclick="fullScan()">全表掃描</button>
+</form>
+<table>
+<thead><tr>
+  <th><input type="checkbox" onclick="toggleAll(this)"></th>
+  <th>Product code</th><th>品名</th><th>連結</th><th>有效</th><th>問題</th>
+  <th>最低價 (IDR)</th><th>基準覆寫</th><th>最後檢查</th>
+</tr></thead>
+<tbody>
+{% for r in rows %}
+<tr>
+  <td><input type="checkbox" class="sel" value="{{ r.code }}"></td>
+  <td><a href="/product/{{ r.code | urlencode }}">{{ r.code }}</a></td>
+  <td>{{ r.item_name or '' }}</td>
+  <td>{{ r.n_links }}</td>
+  <td class="{{ 'ok' if r.n_valid > 1 else 'bad' }}">{{ r.n_valid }}</td>
+  <td>
+    {% if r.n_bad %}<span class="tag bad">{{ r.n_bad }} 無效類</span>{% endif %}
+    {% if r.n_error %}<span class="tag warn">{{ r.n_error }} 錯誤</span>{% endif %}
+    {% if r.n_conflict %}<span class="tag warn">note</span>{% endif %}
+    {% if r.n_unchecked %}<span class="tag">{{ r.n_unchecked }} 未查</span>{% endif %}
+  </td>
+  <td class="num">{{ '{:,}'.format(r.min_price) if r.min_price else '' }}</td>
+  <td class="num">{{ '{:,}'.format(r.baseline_override_idr) if r.baseline_override_idr else '自動' }}</td>
+  <td class="dim">{{ (r.last_checked or '')[:16] }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<div class="pager">
+  {% if page > 1 %}<a href="?q={{ q }}&filter={{ flt }}&page={{ page-1 }}">‹ 上一頁</a>{% endif %}
+  第 {{ page }} / {{ pages if pages else 1 }} 頁
+  {% if page < pages %}<a href="?q={{ q }}&filter={{ flt }}&page={{ page+1 }}">下一頁 ›</a>{% endif %}
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function selected() {
+  return Array.from(document.querySelectorAll('.sel:checked')).map(x => x.value);
+}
+function toggleAll(cb) {
+  document.querySelectorAll('.sel').forEach(x => x.checked = cb.checked);
+}
+async function checkSelected() {
+  const codes = selected();
+  if (!codes.length) return alert('請先勾選商品');
+  const r = await api('/api/jobs', {kind: 'check', product_codes: codes});
+  if (r.ok) location.href = '/jobs/' + r.job_id;
+}
+async function findSelected() {
+  const codes = selected();
+  if (!codes.length) return alert('請先勾選商品');
+  const r = await api('/api/jobs', {kind: 'find', product_codes: codes});
+  if (r.ok) location.href = '/jobs/' + r.job_id;
+}
+async function fullScan() {
+  if (!confirm('全表掃描 2,700+ 條連結需要數小時，確定開始？（可隨時暫停/停止）')) return;
+  const r = await api('/api/jobs', {kind: 'full_scan', include_find: true});
+  if (r.ok) location.href = '/jobs/' + r.job_id;
+}
+</script>
+{% endblock %}

@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>寫入審核</h1>
+<section class="card">
+  <div class="row">
+    <button onclick="applyAll()">套用全部待寫入</button>
+    <button onclick="applySelected()">套用勾選</button>
+    <button class="warn" onclick="discardSelected()">捨棄勾選</button>
+    <span class="dim">dry-run 模式下，所有變更都先停在這裡，按「套用」才會寫進 Google Sheet</span>
+  </div>
+</section>
+
+<section class="card">
+<h2>待寫入（{{ writes | selectattr('state', 'equalto', 'pending') | list | length }} pending / {{ writes | selectattr('state', 'equalto', 'failed') | list | length }} failed）</h2>
+<table>
+<thead><tr><th><input type="checkbox" onclick="toggleAll(this)"></th>
+<th>#</th><th>類型</th><th>商品</th><th>內容</th><th>狀態</th><th>錯誤</th></tr></thead>
+<tbody>
+{% for w in writes %}
+<tr>
+  <td>{% if w.state == 'pending' %}<input type="checkbox" class="sel" value="{{ w.id }}">{% endif %}</td>
+  <td class="dim">{{ w.id }}</td>
+  <td><span class="tag">{{ w.kind }}</span></td>
+  <td><a href="/product/{{ w.product_code | urlencode }}">{{ w.product_code }}</a></td>
+  <td class="mono">
+    {% if w.kind == 'update_price' %}E 欄 → {{ '{:,}'.format(w.payload.price_idr) }}
+    {% elif w.kind == 'set_note' %}I 欄 → "{{ w.payload.note }}"
+    {% elif w.kind == 'clear_note' %}I 欄 → 清空
+    {% elif w.kind == 'insert_link_row' %}插入新列：{{ (w.payload.page_name or '')[:50] }} / {{ w.payload.variant_text }} / {{ '{:,}'.format(w.payload.price_idr) if w.payload.price_idr else '?' }} IDR / {{ w.payload.supplier }}
+    {% endif %}
+  </td>
+  <td><span class="tag st-{{ w.state }}">{{ w.state }}</span></td>
+  <td class="dim">{{ w.error or '' }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+
+{% if cands %}
+<section class="card">
+<h2>候選連結待審（{{ cands | length }}）</h2>
+<table>
+<thead><tr><th>商品</th><th>標題 / 規格</th><th>賣場 / 地區</th><th>價格</th><th>銷量</th><th>相似度</th><th></th></tr></thead>
+<tbody>
+{% for c in cands %}
+<tr>
+  <td><a href="/product/{{ c.product_code | urlencode }}">{{ c.product_code }}</a></td>
+  <td><a href="https://shopee.co.id/product/{{ c.shopid }}/{{ c.itemid }}" target="_blank">{{ (c.title or '')[:60] }}</a>
+      <div class="dim">{{ c.variant_text }} {{ c.note or '' }}</div></td>
+  <td>{{ c.shop_name }}<div class="dim">{{ c.shop_location }}</div></td>
+  <td class="num">{{ '{:,}'.format(c.price_idr) if c.price_idr else '' }}</td>
+  <td class="num">{{ c.sold or 0 }}</td>
+  <td class="num">{{ '%.0f%%' % (c.image_sim * 100) if c.image_sim else '—' }}</td>
+  <td><button onclick="cand({{ c.id }}, 'accept')">採用</button>
+      <button class="warn" onclick="cand({{ c.id }}, 'reject')">拒絕</button></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script>
+function toggleAll(cb) { document.querySelectorAll('.sel').forEach(x => x.checked = cb.checked); }
+function selectedIds() { return Array.from(document.querySelectorAll('.sel:checked')).map(x => +x.value); }
+async function applyAll() {
+  const r = await api('/api/writes/apply', {});
+  if (r.ok) location.href = '/jobs/' + r.job_id; else alert(r.error || '失敗');
+}
+async function applySelected() {
+  const ids = selectedIds();
+  if (!ids.length) return alert('請先勾選');
+  const r = await api('/api/writes/apply', {ids});
+  if (r.ok) location.href = '/jobs/' + r.job_id;
+}
+async function discardSelected() {
+  const ids = selectedIds();
+  if (!ids.length) return alert('請先勾選');
+  await api('/api/writes/discard', {ids});
+  location.reload();
+}
+async function cand(id, action) {
+  await api(`/api/candidates/${id}/${action}`, {});
+  location.reload();
+}
+</script>
+{% endblock %}

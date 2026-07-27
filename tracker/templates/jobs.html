@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>任務</h1>
+<table>
+<thead><tr><th>#</th><th>類型</th><th>狀態</th><th>進度</th><th>訊息</th><th>建立</th><th></th></tr></thead>
+<tbody>
+{% for j in rows %}
+<tr>
+  <td><a href="/jobs/{{ j.id }}">{{ j.id }}</a></td>
+  <td>{{ j.kind }}</td>
+  <td><span class="tag st-{{ j.state }}">{{ j.state }}</span></td>
+  <td>{{ j.progress_done }} / {{ j.progress_total }}</td>
+  <td class="dim">{{ j.message or '' }}</td>
+  <td class="dim">{{ (j.created_at or '')[:16] }}</td>
+  <td>
+    {% if j.state in ('running','pending') %}
+      <button onclick="jobAction({{ j.id }}, 'pause')">暫停</button>
+      <button class="warn" onclick="jobAction({{ j.id }}, 'stop')">停止</button>
+    {% elif j.state in ('paused_user','paused_captcha','paused_login') %}
+      <button onclick="jobAction({{ j.id }}, 'resume')">續跑</button>
+      <button class="warn" onclick="jobAction({{ j.id }}, 'stop')">停止</button>
+    {% endif %}
+  </td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endblock %}
+{% block scripts %}
+<script>
+async function jobAction(id, action) {
+  await api(`/api/jobs/${id}/${action}`, {});
+  location.reload();
+}
+setInterval(() => location.reload(), 10000);
+</script>
+{% endblock %}

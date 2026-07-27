@@ -1,0 +1,499 @@
+"""Google Sheet pull/mirror and the relocation-based write-back executor.
+
+The xlsx reader and the Sheets API reader both produce the same intermediate
+row shape, so parse_rows()/sync_mirror() are shared between offline tests and
+the live sheet:  {"row": int, "vals": {"A".."K": str}, "h_url": str|None,
+"e_num": float|None}
+"""
+import json
+import logging
+import os
+import re
+import threading
+
+from . import config as cfg
+from . import db
+from . import linkparse
+
+log = logging.getLogger(__name__)
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+COLS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]
+
+# Machine-written note vocabulary. I-column values outside this set are human
+# notes and must never be overwritten (SPEC: 防蓋規則).
+MACHINE_NOTES = {"invalid", "sold out", "unlisted", "high cost"}
+
+
+class GoogleAuthNeeded(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- auth ------
+
+_auth_lock = threading.Lock()
+_auth_flow_state = {"running": False, "error": None}
+
+
+def get_creds():
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    if not os.path.exists(cfg.GOOGLE_TOKEN_PATH):
+        raise GoogleAuthNeeded("尚未完成 Google 授權")
+    creds = Credentials.from_authorized_user_file(cfg.GOOGLE_TOKEN_PATH, SCOPES)
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(cfg.GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+        else:
+            raise GoogleAuthNeeded("Google 授權已失效，請重新授權")
+    return creds
+
+
+def auth_status():
+    try:
+        get_creds()
+        return {"ok": True, "flow_running": _auth_flow_state["running"],
+                "error": _auth_flow_state["error"]}
+    except GoogleAuthNeeded as e:
+        return {"ok": False, "reason": str(e),
+                "has_client_secret": os.path.exists(cfg.CLIENT_SECRET_PATH),
+                "flow_running": _auth_flow_state["running"],
+                "error": _auth_flow_state["error"]}
+
+
+def start_auth_flow():
+    """Run the InstalledAppFlow in a background thread (opens a browser)."""
+    if not os.path.exists(cfg.CLIENT_SECRET_PATH):
+        raise GoogleAuthNeeded(f"找不到 {cfg.CLIENT_SECRET_PATH}，請先放入 OAuth 用戶端憑證")
+    with _auth_lock:
+        if _auth_flow_state["running"]:
+            return
+        _auth_flow_state.update(running=True, error=None)
+
+    def run():
+        try:
+            from google_auth_oauthlib.flow import InstalledAppFlow
+            flow = InstalledAppFlow.from_client_secrets_file(cfg.CLIENT_SECRET_PATH, SCOPES)
+            creds = flow.run_local_server(port=0, open_browser=True,
+                                          authorization_prompt_message="")
+            with open(cfg.GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+            log.info("Google OAuth completed")
+        except Exception as e:  # surfaced in settings UI
+            log.exception("Google OAuth flow failed")
+            _auth_flow_state["error"] = str(e)
+        finally:
+            _auth_flow_state["running"] = False
+
+    threading.Thread(target=run, name="google-oauth", daemon=True).start()
+
+
+def _session():
+    from google.auth.transport.requests import AuthorizedSession
+    return AuthorizedSession(get_creds())
+
+
+# ---------------------------------------------------------------- readers ---
+
+def read_xlsx(path=None):
+    """Offline reader for the downloaded copy — same shape as read_google()."""
+    import openpyxl
+    path = path or cfg.XLSX_PATH
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb[cfg.get("worksheet_name")]
+    rows = []
+    for r in range(1, ws.max_row + 1):
+        vals, h_url, e_num = {}, None, None
+        for i, col in enumerate(COLS, start=1):
+            cell = ws.cell(row=r, column=i)
+            v = cell.value
+            if col == "E" and isinstance(v, (int, float)):
+                e_num = float(v)
+            if col == "H" and cell.hyperlink is not None:
+                h_url = cell.hyperlink.target
+            vals[col] = "" if v is None else str(v).strip()
+        rows.append({"row": r, "vals": vals, "h_url": h_url, "e_num": e_num})
+    return rows
+
+
+FIELDS_MASK = ("sheets(properties(sheetId,title),"
+               "data(startRow,startColumn,rowData(values("
+               "formattedValue,hyperlink,"
+               "effectiveValue(numberValue,stringValue),"
+               "userEnteredValue(formulaValue),"
+               "textFormatRuns(format(link(uri)))))))")
+
+
+def read_google(ranges=None):
+    """Pull grid data (values + hyperlinks) from the live sheet."""
+    ws = cfg.get("worksheet_name")
+    ranges = ranges or [f"{ws}!A1:K"]
+    sess = _session()
+    params = [("includeGridData", "true"), ("fields", FIELDS_MASK)]
+    params += [("ranges", r) for r in ranges]
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{cfg.get('sheet_id')}"
+    resp = sess.get(url, params=params, timeout=180)
+    resp.raise_for_status()
+    payload = resp.json()
+    sheet = None
+    for s in payload.get("sheets", []):
+        if s.get("properties", {}).get("title") == ws:
+            sheet = s
+            break
+    if sheet is None:
+        raise RuntimeError(f"找不到分頁「{ws}」")
+    db.setting_set("worksheet_sheet_id", sheet["properties"]["sheetId"])
+
+    rows = []
+    for block in sheet.get("data", []):
+        start_row = block.get("startRow", 0)
+        start_col = block.get("startColumn", 0)
+        for i, rd in enumerate(block.get("rowData", [])):
+            r = start_row + i + 1
+            vals, h_url, e_num = {c: "" for c in COLS}, None, None
+            for j, cv in enumerate(rd.get("values", [])):
+                ci = start_col + j
+                if ci >= len(COLS):
+                    break
+                col = COLS[ci]
+                text = (cv.get("formattedValue") or "").strip()
+                vals[col] = text
+                eff = cv.get("effectiveValue", {})
+                if col == "E" and "numberValue" in eff:
+                    e_num = eff["numberValue"]
+                if col == "H":
+                    h_url = cv.get("hyperlink")
+                    if not h_url:
+                        for run in cv.get("textFormatRuns", []) or []:
+                            uri = run.get("format", {}).get("link", {}).get("uri")
+                            if uri:
+                                h_url = uri
+                                break
+                    if not h_url:
+                        formula = cv.get("userEnteredValue", {}).get("formulaValue", "")
+                        m = re.search(r'HYPERLINK\s*\(\s*"([^"]+)"', formula, re.I)
+                        if m:
+                            h_url = m.group(1)
+                    if not h_url and text.startswith("http"):
+                        h_url = text
+            rows.append({"row": r, "vals": vals, "h_url": h_url, "e_num": e_num})
+    rows.sort(key=lambda x: x["row"])
+    return rows
+
+
+def get_sheet_id_num():
+    v = db.setting_get("worksheet_sheet_id")
+    if v is not None:
+        return int(v)
+    read_google(ranges=[f"{cfg.get('worksheet_name')}!A1:A1"])
+    return int(db.setting_get("worksheet_sheet_id"))
+
+
+# ---------------------------------------------------------------- parsing ---
+
+def parse_price(row):
+    if row["e_num"] is not None:
+        return int(round(row["e_num"]))
+    s = row["vals"].get("E", "")
+    if not s:
+        return None
+    digits = re.sub(r"[^\d]", "", s)
+    return int(digits) if digits else None
+
+
+def is_link_row(row):
+    if row["h_url"]:
+        return True
+    return row["vals"].get("H", "").startswith("http")
+
+
+def parse_rows(rows):
+    """Shared parser. Returns (products, links, last_row_by_code).
+
+    products: {code: {"item_name": str, "first_row": int}}
+    links: list of dicts ready for sync_mirror()
+    last_row_by_code: 1-based last sheet row belonging to each code's group
+    (used by the insert executor when computed from a *fresh* pull).
+    """
+    products, links, last_row = {}, [], {}
+    code = None
+    for row in rows:
+        if row["row"] == 1:  # header
+            continue
+        a = row["vals"].get("A", "").strip()
+        if a:
+            code = a
+        if not code:
+            continue
+        b = row["vals"].get("B", "").strip()
+        if code not in products:
+            products[code] = {"item_name": b, "first_row": row["row"]}
+        elif b and not products[code]["item_name"]:
+            products[code]["item_name"] = b
+        # group extent: any row that carries this code explicitly or any content
+        if a or any(row["vals"].get(c, "") for c in ("B", "C", "D", "E", "G", "H", "I")):
+            last_row[code] = row["row"]
+        if not is_link_row(row):
+            continue
+        raw_url = row["h_url"] or row["vals"]["H"].strip()
+        links.append({
+            "product_code": code,
+            "sheet_row": row["row"],
+            "raw_url": raw_url,
+            "page_name": row["vals"].get("C", ""),
+            "variant_text": row["vals"].get("D", ""),
+            "price_idr": parse_price(row),
+            "supplier": row["vals"].get("G", ""),
+            "note": row["vals"].get("I", ""),
+        })
+    return products, links, last_row
+
+
+def enrich_link_ids(link):
+    """Static (no-network) id extraction; short links use url_cache only."""
+    url = link["raw_url"]
+    final = url
+    if not linkparse.is_shopee(url):
+        row = db.q1("SELECT final_url FROM url_cache WHERE short_url=?", (url,))
+        final = row["final_url"] if row and row["final_url"] else None
+    ids = linkparse.parse_shopee_url(final) if final else None
+    if ids:
+        link.update(shopid=ids["shopid"], itemid=ids["itemid"], model_id=ids["model_id"],
+                    dedupe_key=linkparse.dedupe_key(ids["shopid"], ids["itemid"]),
+                    canonical_url=linkparse.canonical_url(ids["shopid"], ids["itemid"], ids["model_id"]))
+    else:
+        link.update(shopid=None, itemid=None, model_id=None, dedupe_key="", canonical_url=None)
+    return link
+
+
+def sync_mirror(rows):
+    """Upsert parsed sheet rows into SQLite. Identity: (product_code, raw_url)."""
+    products, links, _ = parse_rows(rows)
+    c = db.conn()
+    with c:
+        for code, meta in products.items():
+            c.execute(
+                "INSERT INTO products(code, item_name, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(code) DO UPDATE SET item_name=excluded.item_name, updated_at=excluded.updated_at",
+                (code, meta["item_name"], db.now()))
+        c.execute("UPDATE links SET active=0 WHERE origin='sheet'")
+        for lk in links:
+            enrich_link_ids(lk)
+            c.execute(
+                """INSERT INTO links(product_code, sheet_row_hint, raw_url, canonical_url,
+                     shopid, itemid, model_id, dedupe_key, page_name, variant_text,
+                     price_idr, supplier, note, active, origin)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,'sheet')
+                   ON CONFLICT(product_code, raw_url) DO UPDATE SET
+                     sheet_row_hint=excluded.sheet_row_hint,
+                     canonical_url=COALESCE(excluded.canonical_url, links.canonical_url),
+                     shopid=COALESCE(excluded.shopid, links.shopid),
+                     itemid=COALESCE(excluded.itemid, links.itemid),
+                     model_id=COALESCE(excluded.model_id, links.model_id),
+                     dedupe_key=CASE WHEN excluded.dedupe_key!='' THEN excluded.dedupe_key ELSE links.dedupe_key END,
+                     page_name=excluded.page_name, variant_text=excluded.variant_text,
+                     price_idr=excluded.price_idr, supplier=excluded.supplier,
+                     note=excluded.note, active=1, origin='sheet'""",
+                (lk["product_code"], lk["sheet_row"], lk["raw_url"], lk["canonical_url"],
+                 lk["shopid"], lk["itemid"], lk["model_id"], lk["dedupe_key"],
+                 lk["page_name"], lk["variant_text"], lk["price_idr"], lk["supplier"], lk["note"]))
+    db.setting_set("last_sync_at", db.now())
+    return {"products": len(products), "links": len(links)}
+
+
+def pull_and_sync():
+    return sync_mirror(read_google())
+
+
+def import_xlsx(path=None):
+    return sync_mirror(read_xlsx(path))
+
+
+# ------------------------------------------------------------- write-back ---
+
+def is_machine_note(note: str) -> bool:
+    return (note or "").strip().lower() in MACHINE_NOTES
+
+
+def _col_range(ws, col, row):
+    return f"{ws}!{col}{row}"
+
+
+class Relocator:
+    """Fresh-pull row map. Never trusts sheet_row_hint."""
+
+    def __init__(self):
+        self.rows = read_google()
+        self.products, self.links, self.last_row = parse_rows(self.rows)
+        self.by_raw = {}
+        self.by_ids = {}
+        self.note_at = {}
+        for lk in self.links:
+            enrich_link_ids(lk)
+            self.by_raw.setdefault((lk["product_code"], lk["raw_url"]), []).append(lk["sheet_row"])
+            if lk["dedupe_key"]:
+                self.by_ids.setdefault(
+                    (lk["product_code"], lk["dedupe_key"], lk["model_id"]), []).append(lk["sheet_row"])
+            self.note_at[lk["sheet_row"]] = lk["note"]
+
+    def locate(self, product_code, raw_url, dedupe_key=None, model_id=None):
+        hits = self.by_raw.get((product_code, raw_url), [])
+        if len(hits) == 1:
+            return hits[0]
+        if dedupe_key:
+            hits = self.by_ids.get((product_code, dedupe_key, model_id), [])
+            if len(hits) == 1:
+                return hits[0]
+            loose = [r for (c, d, m), rs in self.by_ids.items()
+                     if c == product_code and d == dedupe_key for r in rs]
+            if len(loose) == 1:
+                return loose[0]
+        return None
+
+    def shift_after(self, row_index):
+        for m in (self.by_raw, self.by_ids):
+            for k, rs in m.items():
+                m[k] = [r + 1 if r > row_index else r for r in rs]
+        self.note_at = {(r + 1 if r > row_index else r): v for r, v in self.note_at.items()}
+        self.last_row = {k: (v + 1 if v > row_index else v) for k, v in self.last_row.items()}
+
+
+def apply_writes(write_ids, progress=None):
+    """Execute approved pending_writes against the live sheet.
+
+    Cell updates (price/note) first in one batch, then row inserts one at a
+    time with read-back verification.
+    """
+    ws = cfg.get("worksheet_name")
+    sid = cfg.get("sheet_id")
+    sheet_num = get_sheet_id_num()
+    sess = _session()
+    base = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}"
+
+    writes = [dict(r) for r in db.q(
+        f"SELECT * FROM pending_writes WHERE id IN ({','.join('?'*len(write_ids))})", write_ids)]
+    reloc = Relocator()
+    results = {"written": 0, "failed": 0}
+
+    def fail(w, msg):
+        db.x("UPDATE pending_writes SET state='failed', error=? WHERE id=?", (msg, w["id"]))
+        results["failed"] += 1
+        log.warning("write %s failed: %s", w["id"], msg)
+
+    def mark_written(w):
+        db.x("UPDATE pending_writes SET state='written', error=NULL, written_at=? WHERE id=?",
+             (db.now(), w["id"]))
+        results["written"] += 1
+
+    # ---- phase 1: cell updates -------------------------------------------
+    value_data, done_cell_writes = [], []
+    for w in writes:
+        if w["kind"] not in ("update_price", "set_note", "clear_note"):
+            continue
+        p = db.jload(w["payload_json"], {})
+        row = reloc.locate(w["product_code"], p.get("raw_url", ""), w["dedupe_key"], w["model_id"])
+        if row is None:
+            fail(w, "row not found（表格可能已被編輯，請重新拉取後再試）")
+            continue
+        if w["kind"] == "update_price":
+            value_data.append({"range": _col_range(ws, "E", row), "values": [[p["price_idr"]]]})
+        else:
+            current = reloc.note_at.get(row, "")
+            if current and not is_machine_note(current):
+                fail(w, f"note conflict：I 欄有人工備註「{current}」，未覆寫")
+                continue
+            new_note = "" if w["kind"] == "clear_note" else p["note"]
+            if (current or "").strip() == new_note.strip():
+                mark_written(w)  # already in desired state
+                continue
+            value_data.append({"range": _col_range(ws, "I", row), "values": [[new_note]]})
+        done_cell_writes.append(w)
+
+    if value_data:
+        resp = sess.post(f"{base}/values:batchUpdate", json={
+            "valueInputOption": "USER_ENTERED", "data": value_data}, timeout=120)
+        if resp.status_code != 200:
+            for w in done_cell_writes:
+                fail(w, f"batchUpdate HTTP {resp.status_code}: {resp.text[:200]}")
+            done_cell_writes = []
+        else:
+            for w in done_cell_writes:
+                mark_written(w)
+    else:
+        for w in done_cell_writes:
+            mark_written(w)
+    if progress:
+        progress(len(done_cell_writes), len(writes))
+
+    # ---- phase 2: row inserts (sequential, verified) ---------------------
+    inserts = [w for w in writes if w["kind"] == "insert_link_row"]
+    for n, w in enumerate(inserts, 1):
+        p = db.jload(w["payload_json"], {})
+        code = w["product_code"]
+        last = reloc.last_row.get(code)
+        if last is None:
+            fail(w, f"product group not found for {code}")
+            continue
+        new_row = last + 1
+        try:
+            reqs = [{"insertDimension": {
+                "range": {"sheetId": sheet_num, "dimension": "ROWS",
+                          "startIndex": last, "endIndex": last + 1},
+                "inheritFromBefore": True}}]
+            r1 = sess.post(f"{base}:batchUpdate", json={"requests": reqs}, timeout=60)
+            r1.raise_for_status()
+
+            h_formula = f'=HYPERLINK("{p["url"]}")'
+            r2 = sess.post(f"{base}/values:batchUpdate", json={
+                "valueInputOption": "USER_ENTERED",
+                "data": [
+                    {"range": f"{ws}!C{new_row}:E{new_row}",
+                     "values": [[p.get("page_name", ""), p.get("variant_text", ""), p.get("price_idr")]]},
+                    {"range": f"{ws}!G{new_row}:H{new_row}",
+                     "values": [[p.get("supplier", ""), h_formula]]},
+                ]}, timeout=60)
+            r2.raise_for_status()
+
+            # F formula copied from the row above (SPEC: 向下複製)
+            r3 = sess.post(f"{base}:batchUpdate", json={"requests": [{"copyPaste": {
+                "source": {"sheetId": sheet_num, "startRowIndex": last - 1, "endRowIndex": last,
+                           "startColumnIndex": 5, "endColumnIndex": 6},
+                "destination": {"sheetId": sheet_num, "startRowIndex": last, "endRowIndex": last + 1,
+                                "startColumnIndex": 5, "endColumnIndex": 6},
+                "pasteType": "PASTE_FORMULA"}}]}, timeout=60)
+            r3.raise_for_status()
+
+            # read back verification
+            r4 = sess.get(f"{base}/values/{ws}!C{new_row}:H{new_row}",
+                          params={"valueRenderOption": "FORMULA"}, timeout=60)
+            r4.raise_for_status()
+            got = (r4.json().get("values") or [[]])[0]
+            got_h = got[5] if len(got) > 5 else ""
+            if p["url"].split("?")[0] not in str(got_h):
+                fail(w, f"read-back mismatch on row {new_row}: {got_h!r}")
+                continue
+        except Exception as e:
+            fail(w, f"insert error: {e}")
+            continue
+
+        reloc.shift_after(last)
+        reloc.last_row[code] = new_row
+        mark_written(w)
+        # mirror into links
+        db.x("""INSERT INTO links(product_code, sheet_row_hint, raw_url, canonical_url, shopid, itemid,
+                  model_id, dedupe_key, page_name, variant_text, price_idr, supplier, note,
+                  status, origin, active, last_checked_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'found',1,?)
+                ON CONFLICT(product_code, raw_url) DO UPDATE SET active=1, sheet_row_hint=excluded.sheet_row_hint""",
+             (code, new_row, p["url"], p["url"], p.get("shopid"), p.get("itemid"),
+              w["model_id"], w["dedupe_key"] or "", p.get("page_name", ""), p.get("variant_text", ""),
+              p.get("price_idr"), p.get("supplier", ""), "", "valid", db.now()))
+        if p.get("candidate_id"):
+            db.x("UPDATE candidates SET state='written' WHERE id=?", (p["candidate_id"],))
+        if progress:
+            progress(len(done_cell_writes) + n, len(writes))
+
+    return results

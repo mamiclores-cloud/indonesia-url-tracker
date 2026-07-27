@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}任務 {{ job.id }}{% endblock %}
+{% block content %}
+<h1>任務 #{{ job.id }} <small>{{ job.kind }}</small></h1>
+<section class="card">
+  <div class="row">
+    <span class="tag st-{{ job.state }}">{{ job.state }}</span>
+    <b>{{ job.progress_done }} / {{ job.progress_total }}</b>
+    <span class="dim">{{ job.message or '' }}</span>
+  </div>
+  <progress value="{{ job.progress_done }}" max="{{ job.progress_total or 1 }}"></progress>
+  <div class="row">
+    {% if job.state in ('running','pending') %}
+      <button onclick="jobAction('pause')">暫停</button>
+      <button class="warn" onclick="jobAction('stop')">停止</button>
+    {% elif job.state in ('paused_user','paused_captcha','paused_login') %}
+      <button onclick="jobAction('resume')">續跑</button>
+      <button class="warn" onclick="jobAction('stop')">停止</button>
+    {% endif %}
+    <a href="/review"><button type="button">前往審核寫入</button></a>
+  </div>
+</section>
+<section class="card">
+<h2>項目（失敗優先，最新 300 筆）</h2>
+<table>
+<thead><tr><th>#</th><th>類型</th><th>對象</th><th>狀態</th><th>結果</th></tr></thead>
+<tbody>
+{% for i in items %}
+<tr>
+  <td class="dim">{{ i.id }}</td>
+  <td>{{ i.kind }}</td>
+  <td>{{ i.target }}</td>
+  <td><span class="tag st-{{ i.state }}">{{ i.state }}</span></td>
+  <td class="dim mono">{{ (i.result_json or '')[:200] }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+async function jobAction(action) {
+  await api(`/api/jobs/{{ job.id }}/${action}`, {});
+  location.reload();
+}
+{% if job.state in ('running','pending') %}setInterval(() => location.reload(), 5000);{% endif %}
+</script>
+{% endblock %}
