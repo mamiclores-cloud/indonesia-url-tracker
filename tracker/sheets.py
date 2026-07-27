@@ -287,7 +287,12 @@ def sync_mirror(rows):
                 "INSERT INTO products(code, item_name, updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(code) DO UPDATE SET item_name=excluded.item_name, updated_at=excluded.updated_at",
                 (code, meta["item_name"], db.now()))
-        c.execute("UPDATE links SET active=0 WHERE origin='sheet'")
+        # Deactivate ALL links first, then reactivate whatever the sheet still
+        # has. A 'found' link that was written to the sheet but later deleted by
+        # a human must also drop to active=0 — otherwise it lingers as a phantom
+        # valid link and can be re-picked as a finder source. (Rows still present
+        # are re-added below as origin='sheet', active=1.)
+        c.execute("UPDATE links SET active=0")
         for lk in links:
             enrich_link_ids(lk)
             c.execute(
