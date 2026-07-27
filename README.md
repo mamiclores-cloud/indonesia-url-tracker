@@ -15,7 +15,14 @@
    pip install google-auth==2.29.0
    ```
    （其餘 Flask / gspread / Pillow / websocket-client 本機已有。google-auth 必須釘 2.29.0，新版會 import 被 Smart App Control 封鎖的 cryptography DLL。）
-2. **Google 授權**：到 [Google Cloud Console](https://console.cloud.google.com/) 建專案 → 啟用 Google Sheets API → 憑證 → 建立 OAuth 用戶端 ID（應用程式類型：**電腦版**）→ 下載 JSON 存成 `data\client_secret.json` → 設定頁按「連結 Google 帳號」完成授權。
+2. **Google 授權**：這個工具沒有經過 Google 官方驗證（單人使用的本地工具沒必要送審），所以一定要先把自己設成「測試使用者」，不然點下去會卡在「Google 尚未驗證這個應用程式」的警告頁面。到 [Google Cloud Console](https://console.cloud.google.com/) 依序：
+   1. 建立新專案（右上角專案選單 → 新增專案）
+   2. 「API 和服務」→「已啟用的 API 和服務」→「+ 啟用 API 和服務」→ 搜尋 **Google Sheets API** → 啟用
+   3. 「API 和服務」→「OAuth 同意畫面」→ User Type 選 **外部**（External）→ 填應用程式名稱等基本資料 → 一路下一步到「測試使用者」（Test users）畫面 → 按「+ ADD USERS」把你自己的 Google 帳號（`mamiclores@gmail.com`）加進去 → 儲存。保持在 **Testing** 發布狀態即可，不要送審。
+   4. 「API 和服務」→「憑證」→「+ 建立憑證」→「OAuth 用戶端 ID」→ 應用程式類型選 **電腦版應用程式** → 建立 → 下載 JSON 存成 `data\client_secret.json`
+   5. 設定頁按「連結 Google 帳號」→ 瀏覽器彈出的畫面仍會顯示「Google 尚未驗證這個應用程式」（這是正常的，因為沒有送審，不是設定錯誤）→ 點左下角**「進階」**→ 點**「前往〈應用程式名稱〉（不安全）」**→ 用步驟 3 加的測試帳號繼續完成授權
+   
+   之後 token 會快取在 `data\google_token.json`，不用每次重新授權。
 3. **Chrome 登入蝦皮**：設定頁按「啟動 Chrome」（會用獨立的 profile 開啟，不影響平常的 Chrome）→ 在該視窗登入 shopee.co.id 一次。
 4. **錄製位置篩選參數**：在該 Chrome 搜尋任意商品 → 設定頁按「開始錄製」→ 手動套用 Shipped From 篩選（More → Others → 勾三個 Tangerang + 五個 Jakarta → CONFIRM）→ 工具自動記下參數。
 5. **拉取資料**：設定頁按「從 Google Sheet 拉取」（離線測試可用「從本地 xlsx 匯入」）。
