@@ -18,6 +18,12 @@ log = logging.getLogger(__name__)
 
 SIZE_RE = re.compile(r"\d+\s*(?:ml|gr|g|gram|pcs|pc|sachet|l)\b", re.I)
 
+# Keyword-sanity bar (separate from candidate inclusion). Calibrated on real
+# KBT105 #1 data: a correct keyword yields several ≥0.78 near-identical dHash
+# hits in the top page; a wrong keyword yields at most one.
+KEYWORD_CONFIRM_SIM = 0.78
+KEYWORD_CONFIRM_MIN = 2
+
 
 def expand_find(params):
     codes = params.get("product_codes") or []
@@ -43,7 +49,10 @@ def _tokens(text):
     return out
 
 
-def build_keyword(title, variant_text, attempt=1):
+def build_keyword(title, variant_text, attempt=1, brand=None):
+    """Brand + leading product words + size. The brand is critical: Shopee
+    titles often bury it inside a bracketed tag ("[SKINTIFIC CERTIFIED] …")
+    that _tokens strips, and without it the search returns unrelated goods."""
     toks = [t for t in _tokens(title) if not SIZE_RE.fullmatch(t)]
     n = 6 if attempt == 1 else 4
     base = toks[:n]
@@ -55,7 +64,12 @@ def build_keyword(title, variant_text, attempt=1):
         m = SIZE_RE.search(title or "")
         if m:
             size = m.group(0)
-    kw = " ".join(base)
+    parts = base
+    if brand and brand.strip():
+        low = [t.lower() for t in base[:2]]
+        if brand.strip().lower() not in low:
+            parts = [brand.strip()] + base
+    kw = " ".join(parts)
     if size:
         kw = f"{kw} {size}"
     return kw.strip()
@@ -121,11 +135,12 @@ def run_find_links(job, item):
         raise jobs.ItemFailed("此商品沒有可作為來源的連結或商品名稱")
 
     # --- reference data from the source link's PDP ------------------------
-    ref_hashes, src_title, src_variant = [], src["page_name"], src["variant_text"]
+    ref_hashes, src_title, src_variant, src_brand = [], src["page_name"], src["variant_text"], None
     if not keyword_only:
         parsed, _ = drv.get_pdp(src["canonical_url"] or src["raw_url"])
         if parsed.get("exists"):
             src_title = parsed.get("title") or src_title
+            src_brand = parsed.get("brand")
             model, _how = checker.match_variant(src["variant_text"], parsed["models"], src["model_id"])
             img_ids = []
             if model and model.get("image"):
@@ -149,7 +164,7 @@ def run_find_links(job, item):
     proposed = 0
 
     for attempt in (1, 2):
-        kw = build_keyword(src_title, src_variant, attempt)
+        kw = build_keyword(src_title, src_variant, attempt, brand=src_brand)
         if not kw:
             continue
         attempt_log = {"keyword": kw, "tiers": []}
@@ -168,9 +183,14 @@ def run_find_links(job, item):
                 tier_log["note"] = "location filter ineffective"
             pool = [r for r in results if _location_ok(r["shop_location"], tier)] if tier else results
 
-            # image gate + keyword sanity on the top of the page
+            # Two separate bars (calibrated on real KBT105 #1 data):
+            #  - inclusion (sim_threshold): keep a candidate for ranking; loose so
+            #    cheap genuine matches aren't dropped.
+            #  - confirm (KEYWORD_CONFIRM_SIM): "are we even looking at the right
+            #    product?" strict, needs a few near-identical hits in the top page;
+            #    unrelated goods rarely score this high, so this catches bad keywords.
             gated = []
-            sim_pass_top = 0
+            confirm_hits = 0
             for idx, r in enumerate(pool):
                 sim = None
                 if ref_hashes and r.get("image"):
@@ -178,23 +198,25 @@ def run_find_links(job, item):
                     sim = imagesim.best_similarity(ref_hashes, imagesim.dhash(path)) if path else None
                 r["sim"] = sim
                 if ref_hashes:
+                    if idx < 12 and sim is not None and sim >= KEYWORD_CONFIRM_SIM:
+                        confirm_hits += 1
                     if sim is not None and sim >= sim_threshold:
-                        if idx < 10:
-                            sim_pass_top += 1
                         gated.append(r)
                 else:
                     gated.append(r)
-            if ref_hashes and sim_pass_top < 3 and len(pool) >= 5:
+            if ref_hashes and confirm_hits < KEYWORD_CONFIRM_MIN and len(pool) >= 5:
                 # keyword likely wrong (SPEC: 相似度不足代表關鍵字錯誤)
                 keyword_bad = True
-                tier_log["note"] = f"image gate: only {sim_pass_top}/10 top results similar"
+                tier_log["note"] = (f"keyword check: only {confirm_hits} near-identical "
+                                    f"(≥{KEYWORD_CONFIRM_SIM}) in top 12")
                 break
 
             cands = [r for r in gated
                      if f'{r["shopid"]}.{r["itemid"]}' not in existing
                      and f'{r["shopid"]}.{r["itemid"]}' not in seen_cand
                      and (r["sold"] or 0) >= min_sold
-                     and r.get("price_idr")]
+                     and r.get("price_idr")
+                     and not r.get("is_sold_out")]
             cands.sort(key=lambda r: (r["price_idr"], -(r["sold"] or 0)))
             tier_log["passed"] = len(cands)
 

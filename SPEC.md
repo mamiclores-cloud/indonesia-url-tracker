@@ -39,7 +39,7 @@ https://docs.google.com/spreadsheets/d/1DOTTepXR8OZ2wskuiz98ZE6yeplmGp0Ezk0SX_Z_
   - B.sold out/unlisted、C.high cost 每次都要進入有效環節，如果恢復庫存或恢復價格，可重新視為有效連結。
 
 ## 需要找連結的條件
-- 該商品(product code)的有效連結只有 1 或 0 個   
+- 該商品(product code)的有效連結只有 0 ~ 2 個   
 - 找到最佳連結 3 個即可停止
 - 找完搜尋結果第一頁仍不滿 3 個可以停止
  

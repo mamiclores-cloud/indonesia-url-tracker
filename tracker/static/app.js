@@ -7,9 +7,27 @@ async function api(url, data) {
   try { return await r.json(); } catch (e) { return {ok: false, error: 'HTTP ' + r.status}; }
 }
 
+// Server-rendered data pages don't live-update; when a job we were watching
+// finishes, reload once so new prices/statuses/candidates show up.
+const DATA_PAGE = /^\/(products|product\/|review)/.test(location.pathname);
+let watchedJobId = null;
+let reloadedForJob = null;
+const ACTIVE = ['running', 'pending', 'paused_captcha', 'paused_login', 'paused_user'];
+
 async function pollStatus() {
   let s;
   try { s = await fetch('/api/status').then(r => r.json()); } catch (e) { return; }
+
+  if (DATA_PAGE) {
+    if (s.job && ACTIVE.includes(s.job.state)) {
+      watchedJobId = s.job.id;
+    } else if (watchedJobId && reloadedForJob !== watchedJobId) {
+      reloadedForJob = watchedJobId;   // guard against reload loop
+      location.reload();
+      return;
+    }
+  }
+
   const bar = document.getElementById('statusbar');
   if (bar) {
     const parts = [];

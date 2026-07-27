@@ -253,7 +253,7 @@ def parse_pdp(raw):
     be corrected offline against real captures (M2 calibration).
     """
     out = {"exists": True, "reason": None, "unlisted": False, "title": None,
-           "shop_name": None, "images": [], "models": [], "item_status": None}
+           "shop_name": None, "brand": None, "images": [], "models": [], "item_status": None}
     if not isinstance(raw, dict):
         return {"exists": False, "reason": "no-json", "models": [], "images": []}
     err = raw.get("error")
@@ -264,6 +264,8 @@ def parse_pdp(raw):
         out["reason"] = f"api-error:{err}"
         return out
     out["title"] = _first(item, "title", "name")
+    brand = item.get("brand") or (item.get("global_brand") or {}).get("display_name")
+    out["brand"] = brand.strip() if isinstance(brand, str) and brand.strip() else None
     out["item_status"] = _first(item, "item_status", "status")
     status = str(out["item_status"] or "").lower()
     if status in ("banned", "deleted", "sip_deleted"):
@@ -344,8 +346,29 @@ def _model_in_stock(m, item_level=False):
     return None
 
 
+def _sold_to_int(text):
+    """Parse Shopee sold strings like '10RB+ sold', '1,2RB', '56 sold'. RB=1000."""
+    if not text:
+        return None
+    t = str(text).lower().replace("terjual", "").replace("sold", "").strip()
+    m = re.search(r"([\d.,]+)\s*(rb|k|jt)?", t)
+    if not m:
+        return None
+    num = m.group(1).replace(".", "").replace(",", ".")
+    try:
+        val = float(num)
+    except ValueError:
+        return None
+    mult = {"rb": 1000, "k": 1000, "jt": 1_000_000}.get(m.group(2), 1)
+    return int(val * mult)
+
+
 def parse_search(raw):
-    """Normalize search_items payload → list of candidate dicts."""
+    """Normalize search_items payload → list of candidate dicts.
+
+    Handles the current Shopee response (data spread across item_data +
+    item_card_displayed_asset) and the legacy item_basic layout.
+    """
     items = []
     if not isinstance(raw, dict):
         return items
@@ -353,20 +376,50 @@ def parse_search(raw):
     if arr is None and isinstance(raw.get("data"), dict):
         arr = raw["data"].get("items")
     for it in arr or []:
-        b = it.get("item_basic") or it
-        itemid = _first(b, "itemid", "item_id")
-        shopid = _first(b, "shopid", "shop_id")
+        legacy = it.get("item_basic")          # old layout (may be None now)
+        data = it.get("item_data") or {}       # new structured data
+        asset = it.get("item_card_displayed_asset") or {}  # new name/image/location
+        b = legacy or {}
+
+        itemid = _first(b, "itemid", "item_id") or data.get("itemid") or it.get("itemid")
+        shopid = _first(b, "shopid", "shop_id") or data.get("shopid") or it.get("shopid")
         if not itemid or not shopid:
             continue
-        price = _first(b, "price", "price_min")
+
+        # price (micro-units → IDR); prefer new structured, fall back to legacy
+        price = None
+        for src in (data.get("item_card_display_price"), asset.get("display_price")):
+            if isinstance(src, dict) and isinstance(src.get("price"), (int, float)):
+                price = src["price"]
+                break
+        if price is None:
+            price = _first(b, "price", "price_min")
+
+        # sold count
+        sold = None
+        sc = data.get("item_card_display_sold_count") or {}
+        if isinstance(sc.get("historical_sold_count"), (int, float)):
+            sold = int(sc["historical_sold_count"])
+        elif sc.get("historical_sold_count_text"):
+            sold = _sold_to_int(sc["historical_sold_count_text"])
+        elif asset.get("sold_count", {}).get("text"):
+            sold = _sold_to_int(asset["sold_count"]["text"])
+        if sold is None:
+            sold = _first(b, "historical_sold", "sold")
+
+        shop_data = data.get("shop_data") or {}
+        is_ad = bool(it.get("adsid")) or (asset.get("icon_in_image") or {}).get("ads_text") == "Ad"
+
         items.append({
             "itemid": itemid, "shopid": shopid,
-            "title": _first(b, "name", "title") or "",
+            "title": asset.get("name") or _first(b, "name", "title") or "",
             "price_idr": int(price / 100000) if isinstance(price, (int, float)) and price else None,
-            "sold": _first(b, "historical_sold", "sold") or 0,
-            "image": b.get("image"),
-            "shop_location": b.get("shop_location") or "",
-            "is_ad": bool(it.get("adsid")),
+            "sold": sold or 0,
+            "image": asset.get("image") or b.get("image"),
+            "shop_location": asset.get("shop_location") or b.get("shop_location") or "",
+            "shop_name": shop_data.get("shop_name") or "",
+            "is_sold_out": bool(data.get("is_sold_out")) if "is_sold_out" in data else None,
+            "is_ad": is_ad,
         })
     return items
 

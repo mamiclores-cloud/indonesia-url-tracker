@@ -20,7 +20,7 @@ DEFAULTS = {
     "idr_per_twd_divisor": 470,
     "high_cost_pct": 15,
     "min_sold": 100,
-    "image_sim_threshold": 0.75,
+    "image_sim_threshold": 0.6,
     "target_links_per_product": 3,
     "dry_run": True,
     "auto_accept_candidates": False,
