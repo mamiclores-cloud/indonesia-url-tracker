@@ -75,17 +75,17 @@ def main():
     fake.pdp[it25] = {"exists": True, "unlisted": False, "title": "SisterBeauty Skintific CLEANSER",
                       "shop_name": "Sister Beauty", "images": ["imgA"], "item_status": "normal",
                       "models": [{"model_id": rows[25]["model_id"], "name": "Low PH 80ml FULL,CLEANSER Skintific",
-                                  "price_idr": 78000, "stock": 12, "image": "imgA1"}]}
+                                  "price_idr": 78000, "stock": None, "in_stock": True, "image": "imgA1"}]}
     # row26: sold out
     fake.pdp[it26] = {"exists": True, "unlisted": False, "title": "[BPOM] Skintific 5X Ceramide Low pH CLEANSER",
                       "shop_name": "DeBeaute", "images": ["imgB"], "item_status": "normal",
                       "models": [{"model_id": rows[26]["model_id"], "name": "LOW PH 80ml,Skintific",
-                                  "price_idr": 74703, "stock": 0, "image": "imgB1"}]}
+                                  "price_idr": 74703, "stock": None, "in_stock": False, "image": "imgB1"}]}
     # row27: big price jump → high cost (baseline 78000, +15% = 89700)
     fake.pdp[it27] = {"exists": True, "unlisted": False, "title": "Skintific 5x Ceramide Low Ph Facial Wash",
                       "shop_name": "Pretty Perfect", "images": ["imgC"], "item_status": "normal",
                       "models": [{"model_id": rows[27]["model_id"], "name": "80ml",
-                                  "price_idr": 99999, "stock": 4, "image": "imgC1"}]}
+                                  "price_idr": 99999, "stock": None, "in_stock": True, "image": "imgC1"}]}
 
     # ---- check job -------------------------------------------------------
     job_id = jobs.create_job("check", {"product_codes": [CODE]})
@@ -138,7 +138,7 @@ def main():
     fake.pdp[999001] = {"exists": True, "unlisted": False, "title": "Skintific Low pH Cleanser 80ml murah",
                         "shop_name": "TokoMurah", "images": ["n1"], "item_status": "normal",
                         "models": [{"model_id": 777, "name": "LOW PH 80ml,Skintific",
-                                    "price_idr": 70000, "stock": 8, "image": "n1a"}]}
+                                    "price_idr": 70000, "stock": None, "in_stock": True, "image": "n1a"}]}
 
     job_id = jobs.create_job("find", {"product_codes": [CODE]})
     state = run_job_to_completion(job_id)

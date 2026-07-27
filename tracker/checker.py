@@ -189,7 +189,8 @@ def run_fetch_link(job, item):
         return result
     result.update(outcome="ok", match_how=how, model_id=model["model_id"],
                   model_name=model["name"], price_idr=model["price_idr"],
-                  stock=model["stock"], model_image=model.get("image"))
+                  stock=model["stock"], in_stock=model.get("in_stock"),
+                  model_image=model.get("image"))
     return result
 
 
@@ -234,7 +235,7 @@ def run_classify_product(job, item):
         res.get("price_idr") for _, (st, res) in
         ((k, v) for k, v in fresh.items())
         if st == "done" and res.get("outcome") == "ok"
-        and res.get("price_idr") and (res.get("stock") or 0) > 0
+        and res.get("price_idr") and res.get("in_stock") is not False
     ]
     baseline, overridden = effective_baseline(code, in_stock_prices)
     pct = high_cost_pct(code)
@@ -257,10 +258,12 @@ def run_classify_product(job, item):
             elif outcome == "variant_error":
                 status, detail = "error", res.get("detail", "variant not matched")
             elif outcome == "ok":
-                price, stock = res.get("price_idr"), res.get("stock")
+                price = res.get("price_idr")
                 if res.get("unlisted"):
                     status, detail = "unlisted", ""
-                elif (stock or 0) <= 0:
+                elif res.get("in_stock") is False:
+                    # only flag sold_out when Shopee explicitly says unavailable;
+                    # None(unknown) is treated as available so we never false-flag
                     status, detail = "sold_out", ""
                 elif price and threshold and price > threshold:
                     status = "high_cost"
@@ -294,12 +297,13 @@ def run_classify_product(job, item):
                     db.x("UPDATE links SET status_detail=? WHERE id=?",
                          (f"note conflict：人工備註「{current}」未覆寫（判定 {target_note}）", lk["id"]))
 
-    # full_scan: queue the finder for products left with ≤1 valid link
+    # full_scan: queue the finder for any product short of the target number of
+    # valid links (SPEC 原文為 ≤1，使用者要求改為「不到 3 個就找」)
     params = db.jload(job["params_json"], {})
     if job["kind"] == "full_scan" and params.get("include_find", True):
         n_valid = db.q1("SELECT COUNT(*) AS n FROM links WHERE product_code=? AND active=1 AND status='valid'",
                         (code,))["n"]
-        if n_valid <= 1:
+        if n_valid < int(cfg.get("target_links_per_product")):
             jobs.add_item(job["id"], "find_links", code)
             summary["find_queued"] = True
     return summary

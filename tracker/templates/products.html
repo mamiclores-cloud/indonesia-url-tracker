@@ -5,7 +5,7 @@
   <input type="text" name="q" value="{{ q }}" placeholder="搜尋 product code / 品名">
   <select name="filter">
     <option value="">全部</option>
-    <option value="few_valid" {% if flt=='few_valid' %}selected{% endif %}>有效連結 ≤ 1</option>
+    <option value="few_valid" {% if flt=='few_valid' %}selected{% endif %}>有效連結 &lt; {{ target }}</option>
     <option value="bad" {% if flt=='bad' %}selected{% endif %}>有無效/售完/高價</option>
     <option value="error" {% if flt=='error' %}selected{% endif %}>有錯誤</option>
     <option value="conflict" {% if flt=='conflict' %}selected{% endif %}>note conflict</option>
@@ -30,7 +30,7 @@
   <td><a href="/product/{{ r.code | urlencode }}">{{ r.code }}</a></td>
   <td>{{ r.item_name or '' }}</td>
   <td>{{ r.n_links }}</td>
-  <td class="{{ 'ok' if r.n_valid > 1 else 'bad' }}">{{ r.n_valid }}</td>
+  <td class="{{ 'ok' if r.n_valid >= target else 'bad' }}">{{ r.n_valid }}</td>
   <td>
     {% if r.n_bad %}<span class="tag bad">{{ r.n_bad }} 無效類</span>{% endif %}
     {% if r.n_error %}<span class="tag warn">{{ r.n_error }} 錯誤</span>{% endif %}

@@ -46,7 +46,8 @@ def products():
     if q:
         rows = [r for r in rows if q in r["code"].lower() or q in (r["item_name"] or "").lower()]
     if flt == "few_valid":
-        rows = [r for r in rows if r["n_valid"] <= 1]
+        target = int(cfg.get("target_links_per_product"))
+        rows = [r for r in rows if r["n_valid"] < target]
     elif flt == "conflict":
         rows = [r for r in rows if r["n_conflict"] > 0]
     elif flt == "error":
@@ -58,7 +59,8 @@ def products():
     total = len(rows)
     rows = rows[(page - 1) * per: page * per]
     return render_template("products.html", rows=rows, q=q, flt=flt,
-                           page=page, pages=(total + per - 1) // per, total=total)
+                           page=page, pages=(total + per - 1) // per, total=total,
+                           target=int(cfg.get("target_links_per_product")))
 
 
 @bp.get("/product/<path:code>")

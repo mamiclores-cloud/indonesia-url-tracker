@@ -2,6 +2,7 @@
 gate → rank (price first, sold tiebreak, sold<100 excluded) → PDP confirm →
 propose candidates for review.
 """
+import json
 import logging
 import re
 
@@ -61,11 +62,20 @@ def build_keyword(title, variant_text, attempt=1):
 
 
 def _locations_for_tier(tier):
+    """Build a {"param": ..., "value": ...} location filter for this tier's
+    place names, in whichever format record_locations() actually observed
+    the live page using (Shopee has shipped at least two encodings)."""
     if not tier:
-        return ""
-    recorded = cfg.get("search_locations_param") or ""
-    sep = "," if ("," in recorded or not recorded) else recorded
-    return ",".join(tier) if sep == "," else sep.join(tier)
+        return None
+    recorded = cfg.get("search_locations_param") or {}
+    param = recorded.get("param") if isinstance(recorded, dict) else None
+    if param == "fe_filter_options":
+        value = json.dumps([{"group_name": "LOCATIONS", "values": list(tier)}], separators=(",", ":"))
+    else:
+        # default / "locations" format: plain comma-separated place names
+        value = ",".join(tier)
+        param = param or "locations"
+    return {"param": param, "value": value}
 
 
 def _location_ok(shop_location, tier):
@@ -197,7 +207,7 @@ def run_find_links(job, item):
                 if not parsed.get("exists") or parsed.get("unlisted"):
                     continue
                 model, how = checker.match_variant(src_variant, parsed["models"])
-                if model is None or not model.get("price_idr") or (model.get("stock") or 0) <= 0:
+                if model is None or not model.get("price_idr") or model.get("in_stock") is False:
                     continue
                 db.x("""INSERT INTO candidates(product_code, shopid, itemid, model_id, title,
                          variant_text, price_idr, sold, shop_name, shop_location, image_sim,

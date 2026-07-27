@@ -35,7 +35,7 @@ DEFAULTS = {
         ["Jawa Barat"],
         []
     ],
-    "search_locations_param": "",
+    "search_locations_param": {},  # {"param": "locations"|"fe_filter_options", "value": str}
 }
 
 _lock = threading.Lock()

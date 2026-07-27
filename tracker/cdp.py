@@ -124,6 +124,9 @@ def launch_chrome(extra_args=()):
         f"--user-data-dir={cfg.CHROME_PROFILE_DIR}",
         "--no-first-run", "--no-default-browser-check",
         "--disable-features=DefaultBrowserPrompt",
+        # Chrome 111+ 拒絕沒有明確允許的 DevTools WebSocket Origin（403），
+        # 這是專用的除錯 profile，非公開連線來源，允許所有 origin 沒有額外風險
+        "--remote-allow-origins=*",
         *extra_args,
         "https://shopee.co.id/",
     ]
@@ -166,8 +169,13 @@ def connect_tab(tab):
     try:
         return CDPClient(ws_url)
     except Exception as e:
-        # Chrome may 403 the ws handshake depending on origin policy
-        raise CDPError(f"無法附掛 Chrome 分頁: {e}")
+        msg = f"無法附掛 Chrome 分頁: {e}"
+        if "403" in str(e):
+            # Chrome already running without --remote-allow-origins=*（例如用舊版程式碼
+            # 啟動的、或手動開的 Chrome）；此旗標無法在執行中途套用，必須整個關閉重開
+            msg += "\n請完全關閉「啟動 Chrome」開出的那個獨立 Chrome 視窗（工作列上所有屬於它的視窗都關掉），" \
+                   "回設定頁重新按一次「啟動 Chrome」讓它以正確參數重新啟動，再試一次。"
+        raise CDPError(msg)
 
 
 def activate_tab(target_id):

@@ -18,10 +18,14 @@
 
 <section class="card">
   <h2>位置篩選參數</h2>
-  <div class="row dim">在 Chrome 開啟蝦皮搜尋任一關鍵字 → 按下方「開始錄製」→ 手動套用 Shipped From 篩選（More → Others → 勾 Tangerang 與 Jakarta → CONFIRM），工具會自動記下參數格式。</div>
+  <div class="row dim">建議先關掉其他開著的蝦皮搜尋分頁，只留一個，避免錄到不相干的分頁。接著在該分頁按下方「開始錄製」→ 錄製開始後才到 Chrome 手動套用 Shipped From 篩選（More → Others → 勾 Tangerang 與 Jakarta → CONFIRM，順序很重要，篩選要在錄製「之後」套用工具才抓得到）。</div>
   <div class="row">
     <button onclick="recordLoc()">開始錄製</button>
-    <span id="loc-status" class="mono">{{ cfg.search_locations_param or '（尚未錄製）' }}</span>
+    <span id="loc-status" class="mono">
+      {%- if cfg.search_locations_param and cfg.search_locations_param.value -%}
+        {{ cfg.search_locations_param.param }} = {{ cfg.search_locations_param.value[:80] }}
+      {%- else -%}（尚未錄製）{%- endif -%}
+    </span>
   </div>
 </section>
 
@@ -75,12 +79,13 @@ async function importXlsx() {
 async function recordLoc() {
   await api('/api/locations/record', {});
   const el = document.getElementById('loc-status');
-  el.textContent = '錄製中… 請到 Chrome 套用篩選';
+  el.textContent = '錄製中… 請到 Chrome 套用篩選（最長等 3 分鐘）';
   const timer = setInterval(async () => {
     const s = await fetch('/api/locations/status').then(r => r.json());
     if (!s.active) {
       clearInterval(timer);
-      el.textContent = s.result || ('❌ ' + (s.error || '失敗'));
+      el.textContent = s.result ? `${s.result.param} = ${s.result.value.slice(0, 80)}`
+                                 : ('❌ ' + (s.error || '失敗'));
     }
   }, 2000);
 }

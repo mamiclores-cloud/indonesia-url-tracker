@@ -66,23 +66,20 @@ class ShopeeDriver:
         url = params.get("response", {}).get("url", "")
         status = params.get("response", {}).get("status", 0)
         for cap in self._captures:
-            if cap["pattern"] in url and cap["response"] is None:
+            if cap["pattern"] in url and cap["request_id"] is None:
                 cap["request_id"] = params["requestId"]
                 cap["status"] = status
                 cap["url"] = url
 
     def _on_finished(self, params):
+        # Runs on the CDP event-pump thread — must NOT issue a blocking CDP
+        # command here (getResponseBody's reply is read by this very thread, so
+        # calling it here deadlocks until timeout). Just signal the waiter; the
+        # caller thread fetches the body itself.
         rid = params.get("requestId")
         for cap in self._captures:
-            if cap.get("request_id") == rid and cap["response"] is None:
-                try:
-                    body = self.client.send("Network.getResponseBody", {"requestId": rid}, timeout=20)
-                    text = body.get("body", "")
-                    if body.get("base64Encoded"):
-                        text = base64.b64decode(text).decode("utf-8", "replace")
-                    cap["response"] = text
-                except Exception as e:
-                    cap["error"] = str(e)
+            if cap.get("request_id") == rid and not cap["finished"]:
+                cap["finished"] = True
                 cap["event"].set()
 
     def _pace(self):
@@ -121,24 +118,33 @@ class ShopeeDriver:
             cdp.activate_tab(self.target_id)
 
     def navigate_capture(self, url, pattern, timeout=25):
-        """Navigate the work tab and capture the first matching XHR body."""
+        """Navigate the work tab and capture the first matching XHR body.
+
+        The response body is fetched here on the caller thread (never inside
+        the event handler) so the CDP pump thread stays free to read replies.
+        """
         self.ensure()
         self._pace()
-        cap = {"pattern": pattern, "request_id": None, "response": None,
-               "error": None, "status": None, "url": None,
-               "event": threading.Event()}
+        cap = {"pattern": pattern, "request_id": None, "finished": False,
+               "status": None, "url": None, "event": threading.Event()}
         self._captures.append(cap)
         try:
             self.client.send("Page.navigate", {"url": url})
             if not cap["event"].wait(timeout):
                 state = self.check_blocked()
                 raise PageTimeout(f"{pattern} 未出現；頁面={state.get('href','?')}")
-            if cap["error"]:
-                raise PageTimeout(f"body 擷取失敗: {cap['error']}")
             if cap["status"] == 403:
                 self.bring_to_front()
                 raise CaptchaDetected(f"API 403: {cap['url']}")
-            return json.loads(cap["response"])
+            try:
+                body = self.client.send(
+                    "Network.getResponseBody", {"requestId": cap["request_id"]}, timeout=20)
+            except cdp.CDPError as e:
+                raise PageTimeout(f"body 擷取失敗: {e}")
+            text = body.get("body", "")
+            if body.get("base64Encoded"):
+                text = base64.b64decode(text).decode("utf-8", "replace")
+            return json.loads(text)
         except CaptchaDetected:
             self.bring_to_front()
             raise
@@ -151,8 +157,12 @@ class ShopeeDriver:
         try:
             raw = self.navigate_capture(url, PDP_API)
         except PageTimeout:
-            # retry once, then DOM fallback for taken-down pages
+            # retry once, then DOM fallback for taken-down pages. Blank out the
+            # tab first so the SPA actually re-issues get_pc (navigating to the
+            # same URL can be a no-op that never re-fires the XHR).
             try:
+                self.client.send("Page.navigate", {"url": "about:blank"})
+                time.sleep(0.5)
                 raw = self.navigate_capture(url, PDP_API)
             except PageTimeout as e:
                 state = self.check_blocked()
@@ -182,11 +192,13 @@ class ShopeeDriver:
         return last
 
     # ------------------------------------------------------------ search ----
-    def search(self, keyword, locations_param="", page=0):
+    def search(self, keyword, location_filter=None, page=0):
+        """location_filter: {"param": "locations"|"fe_filter_options", "value": str}
+        as produced by record_locations()/finder._locations_for_tier(), or None."""
         q = {"keyword": keyword, "page": page}
         url = "https://shopee.co.id/search?" + urllib.parse.urlencode(q)
-        if locations_param:
-            url += "&locations=" + urllib.parse.quote(locations_param)
+        if location_filter and location_filter.get("value"):
+            url += f"&{location_filter['param']}=" + urllib.parse.quote(location_filter["value"])
         raw = self.navigate_capture(url, SEARCH_API, timeout=30)
         return (parse_search(raw), raw)
 
@@ -277,31 +289,59 @@ def parse_pdp(raw):
             tier_imgs[idx] = im
     for m in models:
         price = _first(m, "price", "price_min")
-        stock = m.get("stock")
-        if stock is None:
-            stock = _first(m, "normal_stock", "total_available_stock")
-        if stock is None:
-            sinfo = m.get("stock_info") or {}
-            stock = _first(sinfo, "total_available_stock", "normal_stock", "stock")
         ext = m.get("extinfo") or {}
         tier_idx = (ext.get("tier_index") or [None])[0]
         out["models"].append({
             "model_id": _first(m, "model_id", "modelid", "id"),
             "name": (m.get("name") or "").strip(),
             "price_idr": int(price / 100000) if isinstance(price, (int, float)) and price else None,
-            "stock": stock,
+            "stock": _model_stock(m),
+            "in_stock": _model_in_stock(m),
             "image": m.get("image") or tier_imgs.get(tier_idx),
         })
     # single-model products sometimes ship an empty models list
     if not out["models"]:
         price = _first(item, "price", "price_min")
-        stock = _first(item, "stock", "normal_stock")
         out["models"].append({
             "model_id": None, "name": "-",
             "price_idr": int(price / 100000) if isinstance(price, (int, float)) and price else None,
-            "stock": stock, "image": imgs[0] if imgs else None,
+            "stock": _model_stock(item), "in_stock": _model_in_stock(item, item_level=True),
+            "image": imgs[0] if imgs else None,
         })
     return out
+
+
+def _model_stock(m):
+    """Numeric stock if Shopee still exposes it (mostly null nowadays)."""
+    for k in ("stock", "normal_stock", "total_available_stock"):
+        v = m.get(k)
+        if isinstance(v, (int, float)):
+            return int(v)
+    sinfo = m.get("stock_info") or {}
+    for k in ("total_available_stock", "normal_stock", "stock"):
+        v = sinfo.get(k)
+        if isinstance(v, (int, float)):
+            return int(v)
+    return None
+
+
+def _model_in_stock(m, item_level=False):
+    """Availability as a tri-state bool. Shopee stopped exposing numeric stock,
+    so prefer the boolean flags it does send (has_stock / is_grayout / status /
+    stock_display). Returns True / False / None(unknown — treated as available
+    by the checker so we never false-flag a live product as sold out)."""
+    if isinstance(m.get("has_stock"), bool):
+        return m["has_stock"]
+    if isinstance(m.get("is_grayout"), bool):
+        return not m["is_grayout"]
+    n = _model_stock(m)
+    if n is not None:
+        return n > 0
+    if item_level:
+        sd = str(m.get("stock_display") or "").strip().lower()
+        if sd:
+            return "in stock" in sd or "stok" in sd
+    return None
 
 
 def parse_search(raw):
@@ -352,50 +392,73 @@ def driver_status():
 
 # -------------------------------------------- location filter recording ----
 
+# Shopee's frontend has been observed using two different query param
+# encodings for the same "Shipped From" filter on different sessions/tabs
+# (older `locations=a,b,c` and newer `fe_filter_options=[{"group_name":
+# "LOCATIONS","values":[...]}]`), so we detect and store whichever the live
+# page actually sends rather than assuming one format.
+LOCATION_PARAM_NAMES = ("fe_filter_options", "locations")
+
 _recording = {"active": False, "result": None, "error": None}
+_recording_lock = threading.Lock()
 
 
 def record_locations(timeout=180):
-    """Attach to the user's own Shopee search tab and record the `locations=`
-    param from the next search_items XHR (fired when they CONFIRM the filter).
+    """Attach to the user's own Shopee search tab(s) and record whichever
+    location-filter query param the next search_items XHR actually carries
+    (fired when they CONFIRM the filter). Listens on every open search tab
+    at once since we can't reliably tell which one the user is using.
     """
-    _recording.update(active=True, result=None, error=None)
+    with _recording_lock:
+        if _recording["active"]:
+            return
+        _recording.update(active=True, result=None, error=None)
 
     def run():
-        client = None
+        clients = []
         try:
             if not cdp.ensure_chrome():
                 raise RuntimeError("Chrome 未啟動")
-            tab = None
-            for t in requests.get(
-                    f"http://127.0.0.1:{cfg.get('chrome_debug_port')}/json", timeout=5).json():
-                if t.get("type") == "page" and "shopee.co.id/search" in t.get("url", ""):
-                    tab = t
-                    break
-            if not tab:
+            tabs = [t for t in requests.get(
+                        f"http://127.0.0.1:{cfg.get('chrome_debug_port')}/json", timeout=5).json()
+                    if t.get("type") == "page" and "shopee.co.id/search" in t.get("url", "")]
+            if not tabs:
                 raise RuntimeError("找不到開著 shopee.co.id/search 的分頁，請先在 Chrome 搜尋任意關鍵字")
-            client = cdp.connect_tab(tab)
-            client.send("Network.enable")
             found = threading.Event()
 
             def on_req(params):
                 url = params.get("request", {}).get("url", "")
-                if SEARCH_API in url:
-                    qs = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
-                    loc = qs.get("locations", [None])[0]
-                    if loc:
-                        _recording["result"] = loc
+                if SEARCH_API not in url:
+                    return
+                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+                for name in LOCATION_PARAM_NAMES:
+                    val = qs.get(name, [None])[0]
+                    if val:
+                        _recording["result"] = {"param": name, "value": val}
                         found.set()
+                        return
 
-            client.on("Network.requestWillBeSent", on_req)
+            for t in tabs:
+                try:
+                    c = cdp.connect_tab(t)
+                except cdp.CDPError as e:
+                    log.warning("record_locations: 無法附掛分頁 %s: %s", t.get("id"), e)
+                    continue
+                c.send("Network.enable")
+                c.on("Network.requestWillBeSent", on_req)
+                clients.append(c)
+            if not clients:
+                raise RuntimeError("找到 shopee 搜尋分頁但全部附掛失敗，請確認 Chrome 是用「啟動 Chrome」開的")
             if not found.wait(timeout):
-                raise RuntimeError("等候逾時：未偵測到帶 locations 參數的搜尋請求")
+                raise RuntimeError(
+                    "等候逾時：未偵測到位置篩選的搜尋請求。請確認錄製開始後才在 Chrome 重新套用篩選"
+                    "（或換個關鍵字重新搜尋一次讓請求重新發出），且分頁數不要開太多，避免抓錯分頁")
             cfg.set_values({"search_locations_param": _recording["result"]})
         except Exception as e:
             _recording["error"] = str(e)
         finally:
-            if client:
-                client.close()
+            for c in clients:
+                c.close()
             _recording["active"] = False
 
     threading.Thread(target=run, daemon=True, name="loc-record").start()
