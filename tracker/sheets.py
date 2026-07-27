@@ -220,6 +220,7 @@ def parse_rows(rows):
     """
     products, links, last_row = {}, [], {}
     code = None
+    prev_code = None
     for row in rows:
         if row["row"] == 1:  # header
             continue
@@ -227,15 +228,22 @@ def parse_rows(rows):
         if a:
             code = a
         if not code:
+            prev_code = None
             continue
         b = row["vals"].get("B", "").strip()
         if code not in products:
             products[code] = {"item_name": b, "first_row": row["row"]}
         elif b and not products[code]["item_name"]:
             products[code]["item_name"] = b
-        # group extent: any row that carries this code explicitly or any content
-        if a or any(row["vals"].get(c, "") for c in ("B", "C", "D", "E", "G", "H", "I")):
-            last_row[code] = row["row"]
+        # Insert point = end of the code's FIRST contiguous block only. A code
+        # that reappears far down the sheet (a duplicate/second block) must not
+        # drag new-link inserts away from its main group — otherwise the row is
+        # written 500 rows away from where the user sees the product.
+        has_content = a or any(row["vals"].get(c, "") for c in ("B", "C", "D", "E", "G", "H", "I"))
+        if has_content:
+            if code not in last_row or prev_code == code:
+                last_row[code] = row["row"]
+            prev_code = code
         if not is_link_row(row):
             continue
         raw_url = row["h_url"] or row["vals"]["H"].strip()

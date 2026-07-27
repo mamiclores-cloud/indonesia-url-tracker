@@ -167,8 +167,10 @@ def run_find_links(job, item):
         else:
             keyword_only = True
 
+    # dedupe only against links CURRENTLY in the sheet (active=1) — a link the
+    # user removed from the sheet should be findable again (SPEC: 與現有連結不重複)
     existing = {r["dedupe_key"] for r in db.q(
-        "SELECT dedupe_key FROM links WHERE product_code=? AND dedupe_key!=''", (code,))}
+        "SELECT dedupe_key FROM links WHERE product_code=? AND dedupe_key!='' AND active=1", (code,))}
     seen_cand = {f'{r["shopid"]}.{r["itemid"]}' for r in db.q(
         "SELECT shopid, itemid FROM candidates WHERE product_code=?", (code,))}
 
