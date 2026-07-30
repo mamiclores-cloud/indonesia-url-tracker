@@ -37,11 +37,14 @@
     <label>圖片相似度門檻 (0–1)<input id="f-sim" type="number" step="0.01" min="0" max="1" value="{{ cfg.image_sim_threshold }}"></label>
     <label>每商品目標有效連結數<input id="f-target" type="number" value="{{ cfg.target_links_per_product }}"></label>
     <label>Dry-run（寫入前需審核）
-      <select id="f-dry"><option value="1" {% if cfg.dry_run %}selected{% endif %}>開（建議）</option>
-      <option value="0" {% if not cfg.dry_run %}selected{% endif %}>關（自動寫入）</option></select></label>
+      <select id="f-dry"><option value="0" {% if not cfg.dry_run %}selected{% endif %}>關（自動寫入，建議）</option>
+      <option value="1" {% if cfg.dry_run %}selected{% endif %}>開（測試用）</option></select></label>
     <label>自動採用候選連結
-      <select id="f-auto"><option value="0" {% if not cfg.auto_accept_candidates %}selected{% endif %}>關（建議）</option>
-      <option value="1" {% if cfg.auto_accept_candidates %}selected{% endif %}>開</option></select></label>
+      <select id="f-auto"><option value="1" {% if cfg.auto_accept_candidates %}selected{% endif %}>開（建議）</option>
+      <option value="0" {% if not cfg.auto_accept_candidates %}selected{% endif %}>關</option></select></label>
+    <label>搜尋關鍵字寫入 Sheet L 欄
+      <select id="f-kw"><option value="1" {% if cfg.record_keyword_to_sheet %}selected{% endif %}>開（驗證用，建議）</option>
+      <option value="0" {% if not cfg.record_keyword_to_sheet %}selected{% endif %}>關</option></select></label>
   </div>
   <div class="row"><button onclick="saveCfg()">儲存設定</button></div>
 </section>
@@ -97,6 +100,7 @@ async function saveCfg() {
     target_links_per_product: document.getElementById('f-target').value,
     dry_run: document.getElementById('f-dry').value === '1',
     auto_accept_candidates: document.getElementById('f-auto').value === '1',
+    record_keyword_to_sheet: document.getElementById('f-kw').value === '1',
   });
   if (r.ok) alert('已儲存');
 }

@@ -22,7 +22,7 @@ def index():
 
 
 PRODUCT_SQL = """
-SELECT p.code, p.item_name, p.baseline_override_idr, p.high_cost_pct,
+SELECT p.code, p.item_name, p.baseline_idr, p.high_cost_pct,
   COUNT(l.id) AS n_links,
   COALESCE(SUM(CASE WHEN l.status='valid' THEN 1 ELSE 0 END),0) AS n_valid,
   COALESCE(SUM(CASE WHEN l.status IN ('invalid','sold_out','unlisted','high_cost') THEN 1 ELSE 0 END),0) AS n_bad,
@@ -65,6 +65,32 @@ def products():
                            target=int(cfg.get("target_links_per_product")))
 
 
+# UI 狀態二值化（客戶 2.1）：畫面只顯示 valid / invalid，細分原因在 Note 與
+# status_detail；unchecked 顯示中性標籤。內部 status 細分保留（復活判斷用）。
+UI_INVALID_STATUSES = {"invalid", "sold_out", "unlisted", "high_cost", "error"}
+
+
+def ui_status(link):
+    if link["status"] == "valid":
+        return "valid"
+    if link["status"] in UI_INVALID_STATUSES:
+        return "invalid"
+    return "unchecked"
+
+
+def split_official(links, target=3):
+    """客戶 2.2：最新價最低的 target 條 valid = 正式連結；其餘 active 連結
+    （invalid + 第 4 名後的 valid）全部進備選區。純計算不落地——備選連結
+    復活且更便宜時，下次 render 自然重新排進正式區。"""
+    act = [l for l in links if l["active"]]
+    valid = sorted([l for l in act if l["status"] == "valid"],
+                   key=lambda l: (l["last_price_idr"] or l["price_idr"] or (1 << 62)))
+    official = valid[:target]
+    official_ids = {l["id"] for l in official}
+    backup = [l for l in act if l["id"] not in official_ids]
+    return official, backup
+
+
 @bp.get("/product/<path:code>")
 def product(code):
     prod = db.q1("SELECT * FROM products WHERE code=?", (code,))
@@ -72,14 +98,14 @@ def product(code):
         return f"無此商品 {code}", 404
     links = [dict(r) for r in db.q(
         "SELECT * FROM links WHERE product_code=? ORDER BY active DESC, sheet_row_hint", (code,))]
-    cands = [dict(r) for r in db.q(
-        "SELECT * FROM candidates WHERE product_code=? ORDER BY state='proposed' DESC, id DESC", (code,))]
-    valid_prices = [l["last_price_idr"] or l["price_idr"] for l in links
-                    if l["active"] and l["status"] == "valid" and (l["last_price_idr"] or l["price_idr"])]
-    auto_baseline = min(valid_prices) if valid_prices else None
-    return render_template("product.html", p=dict(prod), links=links, cands=cands,
-                           auto_baseline=auto_baseline,
-                           global_pct=cfg.get("high_cost_pct"))
+    for l in links:
+        l["ui_status"] = ui_status(l)
+    target = int(cfg.get("target_links_per_product"))
+    official, backup = split_official(links, target)
+    inactive = [l for l in links if not l["active"]]
+    return render_template("product.html", p=dict(prod), links=links,
+                           official=official, backup=backup, inactive=inactive,
+                           target=target, global_pct=cfg.get("high_cost_pct"))
 
 
 @bp.get("/jobs")
@@ -194,11 +220,12 @@ def api_job_action(job_id, action):
 def api_baseline(code):
     data = request.get_json(force=True)
     vals, params = [], []
-    for key in ("baseline_override_idr", "high_cost_pct"):
+    # 客戶 1.5：基準價僅人工可改，任何值都接受（含低於表上最低價）
+    for key in ("baseline_idr", "high_cost_pct"):
         if key in data:
             v = data[key]
             v = None if v in ("", None) else float(v)
-            if key == "baseline_override_idr" and v is not None:
+            if key == "baseline_idr" and v is not None:
                 v = int(v)
             vals.append(f"{key}=?")
             params.append(v)
@@ -276,7 +303,8 @@ def api_loc_status():
 def api_config():
     data = request.get_json(force=True)
     allowed = {"high_cost_pct", "min_sold", "image_sim_threshold", "dry_run",
-               "auto_accept_candidates", "worksheet_name", "sheet_id", "chrome_path",
+               "auto_accept_candidates", "record_keyword_to_sheet",
+               "worksheet_name", "sheet_id", "chrome_path",
                "idr_per_twd_divisor", "target_links_per_product", "pacing",
                "search_locations_param"}
     updates = {k: v for k, v in data.items() if k in allowed}

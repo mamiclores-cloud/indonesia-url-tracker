@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 import urllib.parse
@@ -253,7 +254,8 @@ def parse_pdp(raw):
     be corrected offline against real captures (M2 calibration).
     """
     out = {"exists": True, "reason": None, "unlisted": False, "title": None,
-           "shop_name": None, "brand": None, "images": [], "models": [], "item_status": None}
+           "shop_name": None, "brand": None, "images": [], "models": [], "item_status": None,
+           "shop_location": None, "historical_sold": None}
     if not isinstance(raw, dict):
         return {"exists": False, "reason": "no-json", "models": [], "images": []}
     err = raw.get("error")
@@ -282,6 +284,13 @@ def parse_pdp(raw):
     out["images"] = imgs
     shop = data.get("shop_detailed") or data.get("shop") or {}
     out["shop_name"] = _first(shop, "name", "shop_name", "username") or item.get("shop_name")
+    # 地區/銷量（UI 正式連結區欄位）— key 名跨版本不定，一律 best-effort
+    loc = _first(shop, "shop_location", "place", "region") or item.get("shop_location")
+    out["shop_location"] = loc.strip() if isinstance(loc, str) and loc.strip() else None
+    sold = _first(item, "historical_sold", "global_sold", "sold")
+    if isinstance(sold, str):
+        sold = _sold_to_int(sold)
+    out["historical_sold"] = int(sold) if isinstance(sold, (int, float)) else None
 
     models = item.get("models") or []
     tier_imgs = {}

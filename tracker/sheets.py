@@ -18,11 +18,16 @@ from . import linkparse
 log = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-COLS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]
+# L 欄 = 搜尋關鍵字驗證欄（客戶 1.2；J/K 是人工欄位不可用）。read-only 解析
+# 仍只看 A-I；L 只由程式寫入。
+COLS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
 
 # Machine-written note vocabulary. I-column values outside this set are human
 # notes and must never be overwritten (SPEC: 防蓋規則).
-MACHINE_NOTES = {"invalid", "sold out", "unlisted", "high cost"}
+# 舊詞彙（invalid/unlisted/high cost）必須保留——表上既有的舊機器 note 才能
+# 被新規則覆寫，否則會被當成人工備註永遠洗不掉。
+MACHINE_NOTES = {"invalid", "sold out", "unlisted", "high cost",
+                 "high_cost", "link error", "new"}
 
 
 class GoogleAuthNeeded(Exception):
@@ -130,7 +135,7 @@ FIELDS_MASK = ("sheets(properties(sheetId,title),"
 def read_google(ranges=None):
     """Pull grid data (values + hyperlinks) from the live sheet."""
     ws = cfg.get("worksheet_name")
-    ranges = ranges or [f"{ws}!A1:K"]
+    ranges = ranges or [f"{ws}!A1:L"]
     sess = _session()
     params = [("includeGridData", "true"), ("fields", FIELDS_MASK)]
     params += [("ranges", r) for r in ranges]
@@ -277,6 +282,45 @@ def enrich_link_ids(link):
     return link
 
 
+def seed_baselines(parse_min=None):
+    """Seed products.baseline_idr for products that don't have one yet.
+
+    客戶規則：基準價 = 該商品「未執行查詢前」表上 E 欄最低價，只定植一次，
+    之後僅人工可改。程式已回寫過部分 E 欄，所以優先讀 xlsx 原始快照；
+    快照沒有的商品用 parse_min（本次拉取各 code 最低價）或 mirror 最低價
+    （排除程式插入的 origin='found' 列）。
+    """
+    unseeded = [r["code"] for r in db.q("SELECT code FROM products WHERE baseline_idr IS NULL")]
+    if not unseeded:
+        return {"seeded": 0}
+    snapshot_min = {}
+    if os.path.exists(cfg.XLSX_PATH):
+        try:
+            _, snap_links, _ = parse_rows(read_xlsx())
+            for lk in snap_links:
+                p = lk["price_idr"]
+                if p and p > 0:
+                    code = lk["product_code"]
+                    if code not in snapshot_min or p < snapshot_min[code]:
+                        snapshot_min[code] = p
+        except Exception:
+            log.exception("xlsx snapshot read failed; baseline falls back to mirror prices")
+    seeded = 0
+    for code in unseeded:
+        base = snapshot_min.get(code) or (parse_min or {}).get(code)
+        if base is None:
+            row = db.q1("SELECT MIN(price_idr) AS m FROM links WHERE product_code=? AND active=1 "
+                        "AND origin='sheet' AND price_idr>0", (code,))
+            base = row["m"] if row else None
+        if base:
+            db.x("UPDATE products SET baseline_idr=? WHERE code=? AND baseline_idr IS NULL",
+                 (base, code))
+            seeded += 1
+    if seeded:
+        log.info("baseline seeded for %d products", seeded)
+    return {"seeded": seeded}
+
+
 def sync_mirror(rows):
     """Upsert parsed sheet rows into SQLite. Identity: (product_code, raw_url)."""
     products, links, _ = parse_rows(rows)
@@ -313,6 +357,15 @@ def sync_mirror(rows):
                 (lk["product_code"], lk["sheet_row"], lk["raw_url"], lk["canonical_url"],
                  lk["shopid"], lk["itemid"], lk["model_id"], lk["dedupe_key"],
                  lk["page_name"], lk["variant_text"], lk["price_idr"], lk["supplier"], lk["note"]))
+    # 新商品第一次進系統時定植基準價（此時表上價格必然是「查詢前」的）
+    parse_min = {}
+    for lk in links:
+        p = lk["price_idr"]
+        if p and p > 0:
+            code = lk["product_code"]
+            if code not in parse_min or p < parse_min[code]:
+                parse_min[code] = p
+    seed_baselines(parse_min)
     db.setting_set("last_sync_at", db.now())
     return {"products": len(products), "links": len(links)}
 
@@ -401,6 +454,19 @@ def apply_writes(write_ids, progress=None):
              (db.now(), w["id"]))
         results["written"] += 1
 
+    def mirror_cell_write(w):
+        # keep the local mirror in step so the UI reflects the sheet immediately
+        # instead of waiting for the next pull
+        p = db.jload(w["payload_json"], {})
+        raw = p.get("raw_url", "")
+        if w["kind"] == "update_price":
+            db.x("UPDATE links SET price_idr=? WHERE product_code=? AND raw_url=?",
+                 (p.get("price_idr"), w["product_code"], raw))
+        else:
+            note = "" if w["kind"] == "clear_note" else p.get("note", "")
+            db.x("UPDATE links SET note=? WHERE product_code=? AND raw_url=?",
+                 (note, w["product_code"], raw))
+
     # ---- phase 1: cell updates -------------------------------------------
     value_data, done_cell_writes = [], []
     for w in writes:
@@ -435,9 +501,11 @@ def apply_writes(write_ids, progress=None):
         else:
             for w in done_cell_writes:
                 mark_written(w)
+                mirror_cell_write(w)
     else:
         for w in done_cell_writes:
             mark_written(w)
+            mirror_cell_write(w)
     if progress:
         progress(len(done_cell_writes), len(writes))
 
@@ -460,17 +528,23 @@ def apply_writes(write_ids, progress=None):
             r1.raise_for_status()
 
             h_formula = f'=HYPERLINK("{p["url"]}")'
+            value_batch = [
+                # A 欄填上同樣的 product code（使用者要求：找到的新列也要標明所屬商品）
+                {"range": f"{ws}!A{new_row}",
+                 "values": [[p.get("product_code", code)]]},
+                {"range": f"{ws}!C{new_row}:E{new_row}",
+                 "values": [[p.get("page_name", ""), p.get("variant_text", ""), p.get("price_idr")]]},
+                {"range": f"{ws}!G{new_row}:H{new_row}",
+                 "values": [[p.get("supplier", ""), h_formula]]},
+                # 客戶 1.4：新找到的連結 Note 標「new」，下次檢查依狀態規則覆寫
+                {"range": f"{ws}!I{new_row}", "values": [["new"]]},
+            ]
+            # 客戶 1.2：把找此連結用的搜尋關鍵字寫在同列 L 欄供人工驗證
+            if p.get("search_keyword") and cfg.get("record_keyword_to_sheet", True):
+                value_batch.append({"range": f"{ws}!L{new_row}",
+                                    "values": [[p["search_keyword"]]]})
             r2 = sess.post(f"{base}/values:batchUpdate", json={
-                "valueInputOption": "USER_ENTERED",
-                "data": [
-                    # A 欄填上同樣的 product code（使用者要求：找到的新列也要標明所屬商品）
-                    {"range": f"{ws}!A{new_row}",
-                     "values": [[p.get("product_code", code)]]},
-                    {"range": f"{ws}!C{new_row}:E{new_row}",
-                     "values": [[p.get("page_name", ""), p.get("variant_text", ""), p.get("price_idr")]]},
-                    {"range": f"{ws}!G{new_row}:H{new_row}",
-                     "values": [[p.get("supplier", ""), h_formula]]},
-                ]}, timeout=60)
+                "valueInputOption": "USER_ENTERED", "data": value_batch}, timeout=60)
             r2.raise_for_status()
 
             # F formula copied from the row above (SPEC: 向下複製)
@@ -498,15 +572,16 @@ def apply_writes(write_ids, progress=None):
         reloc.shift_after(last)
         reloc.last_row[code] = new_row
         mark_written(w)
-        # mirror into links
+        # mirror into links（note='new' 與地區/銷量/關鍵字帶入，待下次檢查以 PDP 值覆蓋）
         db.x("""INSERT INTO links(product_code, sheet_row_hint, raw_url, canonical_url, shopid, itemid,
                   model_id, dedupe_key, page_name, variant_text, price_idr, supplier, note,
-                  status, origin, active, last_checked_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'found',1,?)
+                  status, origin, active, last_checked_at, shop_location, sold, search_keyword)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'found',1,?,?,?,?)
                 ON CONFLICT(product_code, raw_url) DO UPDATE SET active=1, sheet_row_hint=excluded.sheet_row_hint""",
              (code, new_row, p["url"], p["url"], p.get("shopid"), p.get("itemid"),
               w["model_id"], w["dedupe_key"] or "", p.get("page_name", ""), p.get("variant_text", ""),
-              p.get("price_idr"), p.get("supplier", ""), "", "valid", db.now()))
+              p.get("price_idr"), p.get("supplier", ""), "new", "valid", db.now(),
+              p.get("shop_location", ""), p.get("sold"), p.get("search_keyword", "")))
         if p.get("candidate_id"):
             db.x("UPDATE candidates SET state='written' WHERE id=?", (p["candidate_id"],))
         if progress:

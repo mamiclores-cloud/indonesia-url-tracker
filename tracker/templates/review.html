@@ -26,7 +26,7 @@
     {% if w.kind == 'update_price' %}E 欄 → {{ '{:,}'.format(w.payload.price_idr) }}
     {% elif w.kind == 'set_note' %}I 欄 → "{{ w.payload.note }}"
     {% elif w.kind == 'clear_note' %}I 欄 → 清空
-    {% elif w.kind == 'insert_link_row' %}插入新列：{{ (w.payload.page_name or '')[:50] }} / {{ w.payload.variant_text }} / {{ '{:,}'.format(w.payload.price_idr) if w.payload.price_idr else '?' }} IDR / {{ w.payload.supplier }}
+    {% elif w.kind == 'insert_link_row' %}插入新列：{{ (w.payload.page_name or '')[:50] }} / {{ w.payload.variant_text }} / {{ '{:,}'.format(w.payload.price_idr) if w.payload.price_idr else '?' }} IDR / {{ w.payload.supplier }} / Note「new」{% if w.payload.search_keyword %} / L 欄關鍵字「{{ w.payload.search_keyword }}」{% endif %}
     {% endif %}
   </td>
   <td><span class="tag st-{{ w.state }}">{{ w.state }}</span></td>

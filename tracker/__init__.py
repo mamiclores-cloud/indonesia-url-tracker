@@ -31,6 +31,13 @@ def create_app(start_worker=True):
     cfg.load()
     db.init()
 
+    # 基準價一次性定植（客戶規則：取「未執行查詢前」表上最低價，之後僅人工可改）
+    try:
+        from . import sheets
+        sheets.seed_baselines()
+    except Exception:
+        logging.getLogger(__name__).exception("baseline seeding failed")
+
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["JSON_AS_ASCII"] = False
 
