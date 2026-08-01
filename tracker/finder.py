@@ -232,6 +232,15 @@ def run_find_links(job, item):
     # 客戶 Q&A：缺幾補幾。殘留的舊 proposed 候選會佔用名額（造成「缺 1 找 3」
     # 的假象），先全部標 expired；只有已 accept 未寫入的仍算在途數量。
     db.x("UPDATE candidates SET state='expired' WHERE product_code=? AND state='proposed'", (code,))
+    # 孤兒 accepted（對應的 insert 寫入已被丟棄/失敗/寫完）不再佔名額，
+    # 否則 need 會被永久壓縮成「缺 2 只找 1」。寫完的由 links 鏡射列接手擋重複。
+    db.x("""UPDATE candidates SET state='expired'
+            WHERE product_code=? AND state='accepted'
+              AND NOT EXISTS (SELECT 1 FROM pending_writes w
+                              WHERE w.kind='insert_link_row' AND w.state='pending'
+                                AND w.product_code=candidates.product_code
+                                AND w.dedupe_key = candidates.shopid || '.' || candidates.itemid)""",
+         (code,))
     already = db.q1("SELECT COUNT(*) AS n FROM candidates WHERE product_code=? AND state='accepted'",
                     (code,))["n"]
     need = target_n - n_valid - already

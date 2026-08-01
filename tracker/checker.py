@@ -21,13 +21,16 @@ log = logging.getLogger(__name__)
 
 RAW_DIR = os.path.join(cfg.DATA_DIR, "raw")
 
-# 客戶 2.1：Note 只用三種原因詞彙；unlisted 歸類為 sold out；連結打不開/
-# 非蝦皮/解析失敗 = link error。valid 清空。（error 不寫 note，靠 status_detail）
+# 客戶 2.1 + 0801 修正單：Note 只用三種原因詞彙，且只要是 invalid 就一定有
+# Note。unlisted 歸 sold out；規格對不上（variant_error）視同該規格已下架，
+# 也歸 sold out；連結打不開/非蝦皮/解析失敗/抓取例外 = link error。valid 清空。
 NOTE_FOR_STATUS = {
     "invalid": "link error",
     "sold_out": "sold out",
     "unlisted": "sold out",
+    "variant_error": "sold out",
     "high_cost": "high_cost",
+    "error": "link error",
     "valid": "",
 }
 
@@ -144,15 +147,20 @@ def match_variant(variant_text, models, url_model_id=None, allow_single_model=Fa
 
 
 def resolve_link(link, drv=None):
-    """Ensure link has a usable shopee URL + ids. Returns final url or None."""
+    """Ensure link has a usable shopee URL + ids. Returns final url or None.
+
+    0801 修正單：requests 解析「停在非蝦皮網址」（短網址擋 UA / JS 跳轉時
+    常停在短網址本身）不算定案，改用瀏覽器實際載入追最終網址；只有瀏覽器
+    也解不到蝦皮才維持原判。成功解析一律入快取，之後免瀏覽器。"""
     url = link["raw_url"]
     if linkparse.is_shopee(url):
         return url
     final = linkparse.resolve_url(url)
-    if final is None and drv is not None:
-        final = drv.resolve_in_browser(url)
-        if final:
-            linkparse.cache_resolution(url, final)
+    if (final is None or not linkparse.is_shopee(final)) and drv is not None:
+        in_browser = drv.resolve_in_browser(url)
+        if in_browser and linkparse.is_shopee(in_browser):
+            linkparse.cache_resolution(url, in_browser)
+            return in_browser
     return final
 
 
@@ -261,7 +269,7 @@ def run_classify_product(job, item):
             if outcome == "invalid":
                 status, detail = "invalid", res.get("reason") or res.get("detail") or ""
             elif outcome == "variant_error":
-                status, detail = "error", res.get("detail", "variant not matched")
+                status, detail = "variant_error", res.get("detail", "variant not matched")
             elif outcome == "ok":
                 price = res.get("price_idr")
                 if res.get("unlisted"):

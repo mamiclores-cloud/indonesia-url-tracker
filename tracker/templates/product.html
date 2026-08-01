@@ -11,6 +11,7 @@
   <td class="dim">{{ l.sheet_row_hint or '' }}</td>
   <td>
     <a href="{{ l.canonical_url or l.raw_url }}" target="_blank">{{ (l.page_name or l.raw_url)[:70] }}</a>
+    {% if l.virtual %}<span class="tag st-pending">待寫入表</span>{% endif %}
     <div class="dim">{{ l.variant_text or '' }}</div>
   </td>
   <td>{{ l.supplier or '' }}</td>
@@ -22,7 +23,7 @@
   <td class="num">{{ '{:,}'.format(lastp) if lastp else '' }}</td>
   <td><span class="tag st-{{ l.ui_status }}">{{ l.ui_status }}</span>
       <div class="dim">{{ l.status_detail or '' }}</div></td>
-  <td>{{ l.note or '' }}</td>
+  <td>{{ l.ui_note or '' }}{% if l.human_note %}<div class="dim">{{ l.human_note }}</div>{% endif %}</td>
   <td class="dim">{{ l.search_keyword or '' }}</td>
   <td class="dim">{{ (l.last_checked_at or '')[:16] }}</td>
 </tr>
@@ -57,7 +58,7 @@
 </section>
 
 <section class="card">
-<h2>正式連結（{{ official | length }} / {{ target }} 條 valid）</h2>
+<h2>正式連結（{{ n_real }} 條 valid{% if n_virtual %} ＋ {{ n_virtual }} 條待寫入{% endif %}／目標 {{ target }} 條）</h2>
 <table>
 {{ link_head() }}
 <tbody>
@@ -76,7 +77,6 @@
 </tbody>
 </table>
 {% if not backup %}<p class="dim">備選區目前是空的。</p>{% endif %}
-{% if inactive %}<p class="dim">另有 {{ inactive | length }} 條已從表上刪除的連結（不顯示）。</p>{% endif %}
 </section>
 {% endblock %}
 {% block scripts %}

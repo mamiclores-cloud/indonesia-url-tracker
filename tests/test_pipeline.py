@@ -13,7 +13,7 @@ from tracker import config as cfg, db  # noqa: E402
 cfg.load()
 db.init()
 
-from tracker import checker, finder, jobs, linkparse, shopee, web  # noqa: E402
+from tracker import checker, finder, jobs, linkparse, sheets, shopee, web  # noqa: E402
 
 CODE = "KBT105 #14"
 
@@ -28,10 +28,15 @@ class FakeDriver:
         self.search_calls = []
         # keyed by itemid
         self.pdp = {}
+        self.pdp_raise = set()       # itemids whose PDP fetch should explode
+        self.browser_resolves = {}   # short url -> final url（模擬瀏覽器追短網址）
+        self.browser_calls = []
 
     def get_pdp(self, url):
         ids = linkparse.parse_shopee_url(url)
         self.pdp_calls.append(ids["itemid"])
+        if ids["itemid"] in self.pdp_raise:
+            raise RuntimeError("fake pdp crash")
         parsed = self.pdp.get(ids["itemid"], {"exists": False, "reason": "api-error:4",
                                               "models": [], "images": []})
         return parsed, {"fake": True}
@@ -44,7 +49,8 @@ class FakeDriver:
         return None
 
     def resolve_in_browser(self, url, timeout=25):
-        return None
+        self.browser_calls.append(url)
+        return self.browser_resolves.get(url)
 
 
 def reset():
@@ -127,19 +133,42 @@ def main():
     assert kw4.count("10 ml") == 1 and "PASSION" in kw4, kw4
     print("build_keyword spec-token OK:", kw2, "/", kw3)
 
-    # ---- unit: split_official（正式前 3 低價 valid，其餘備選）------------
+    # ---- unit: split_official（0801：正式=全部 valid 依價升冪，備選=非 valid）
     mk = lambda i, st, last, sheet=None: {"id": i, "active": 1, "status": st,
                                           "last_price_idr": last, "price_idr": sheet}
     ls = [mk(1, "valid", 90), mk(2, "valid", 70), mk(3, "invalid", 60),
           mk(4, "valid", 80), mk(5, "valid", 95), mk(6, "sold_out", 50), mk(7, "valid", 60)]
     off, back = web.split_official(ls, 3)
-    assert [l["id"] for l in off] == [7, 2, 4], [l["id"] for l in off]
-    assert {l["id"] for l in back} == {1, 3, 5, 6}, [l["id"] for l in back]
-    # 備選 valid 復活變最便宜 → 重算自然進正式（計算制）
-    ls[0]["last_price_idr"] = 10
-    off2, _ = web.split_official(ls, 3)
-    assert [l["id"] for l in off2] == [1, 7, 2]
+    assert [l["id"] for l in off] == [7, 2, 4, 1, 5], [l["id"] for l in off]  # 5 valid 全進正式
+    assert {l["id"] for l in back} == {3, 6}, [l["id"] for l in back]         # 備選只有非 valid
+    # 備選 invalid 復活 → 重算自然進正式；超過 3 條 valid 就維持超過（0801 備註）
+    ls[2]["status"] = "valid"
+    off2, back2 = web.split_official(ls, 3)
+    assert [l["id"] for l in off2] == [3, 7, 2, 4, 1, 5], [l["id"] for l in off2]
+    assert {l["id"] for l in back2} == {6}
     print("split_official OK")
+
+    # ---- unit: derived_note / human_note（0801：Note 由當前狀態推導）------
+    for st, note in [("valid", ""), ("high_cost", "high_cost"), ("sold_out", "sold out"),
+                     ("unlisted", "sold out"), ("variant_error", "sold out"),
+                     ("invalid", "link error"), ("error", "link error"), ("unchecked", "")]:
+        got = web.derived_note({"status": st})
+        assert got == note, (st, got)
+        if st in web.UI_INVALID_STATUSES:
+            assert note, f"UI-invalid 狀態 {st} 必須有 Note"
+    assert web.human_note({"note": "out of stock"}) == "out of stock"
+    assert web.human_note({"note": "high cost"}) == ""   # 機器詞彙不當人工備註
+    assert web.human_note({"note": None}) == ""
+    print("derived_note OK: 所有 invalid 狀態皆有 Note")
+
+    # ---- unit: 插列 value_batch（0801：I 欄不再寫 new，L 欄關鍵字照寫）----
+    vb = sheets._insert_value_batch("ws", 30, CODE, {
+        "url": "https://shopee.co.id/product/1/2", "page_name": "n", "variant_text": "-",
+        "price_idr": 5, "supplier": "s", "search_keyword": "kw", "product_code": CODE})
+    vb_ranges = [v["range"] for v in vb]
+    assert not any("!I" in r for r in vb_ranges), vb_ranges
+    assert "ws!L30" in vb_ranges, vb_ranges
+    print("insert value_batch OK: no I('new'), L keyword kept")
 
     # ---- unit: migration 冪等 --------------------------------------------
     db.init()
@@ -229,6 +258,128 @@ def main():
     finally:
         linkparse.resolve_url = orig_resolve
     print("short-url / non-shopee OK: invalid + link error, job 不中斷")
+
+    # ---- 短網址：瀏覽器 fallback 成功 → valid + url_cache（0801）----------
+    reset()
+    db.x("DELETE FROM url_cache WHERE short_url LIKE 'https://test-short%'")
+    db.x("""INSERT INTO links(product_code, raw_url, page_name, variant_text, price_idr,
+            active, origin, status) VALUES(?, 'https://test-short.example/xyz', 'browser test',
+            '-', 12345, 1, 'sheet', 'unchecked')""", (CODE,))
+    lid2 = db.q1("SELECT id FROM links WHERE raw_url='https://test-short.example/xyz'")["id"]
+    fake.browser_calls.clear()  # 前段非蝦皮測試也會（正確地）觸發瀏覽器 fallback
+    fake.browser_resolves["https://test-short.example/xyz"] = "https://shopee.co.id/product/3210/654321"
+    fake.pdp[654321] = {"exists": True, "unlisted": False, "title": "Resolved item",
+                        "shop_name": "ShortShop", "images": ["r1"], "item_status": "normal",
+                        "shop_location": "Jakarta Barat", "historical_sold": 500,
+                        "models": [{"model_id": 32100, "name": "STD", "price_idr": 12345,
+                                    "stock": None, "in_stock": True, "image": "r1a"}]}
+    orig_resolve = linkparse.resolve_url
+    try:
+        # requests 端永遠停在短網址本身（模擬 reurl.cc 擋 UA / JS 跳轉）
+        linkparse.resolve_url = lambda url, **kw: url
+        job_id = jobs.create_job("check", {"link_ids": [lid2]})
+        assert run_job_to_completion(job_id) == "done"
+        lk = dict(db.q1("SELECT * FROM links WHERE id=?", (lid2,)))
+        assert lk["status"] == "valid", (lk["status"], lk["status_detail"])
+        cached = db.q1("SELECT final_url FROM url_cache WHERE short_url='https://test-short.example/xyz'")
+        assert cached and cached["final_url"] == "https://shopee.co.id/product/3210/654321"
+        assert len(fake.browser_calls) == 1, fake.browser_calls
+    finally:
+        linkparse.resolve_url = orig_resolve
+    # 第二次檢查：真 resolve_url 開頭就命中快取（不打網路），不再呼叫瀏覽器
+    db.x("UPDATE links SET status='unchecked' WHERE id=?", (lid2,))
+    job_id = jobs.create_job("check", {"link_ids": [lid2]})
+    assert run_job_to_completion(job_id) == "done"
+    assert db.q1("SELECT status FROM links WHERE id=?", (lid2,))["status"] == "valid"
+    assert len(fake.browser_calls) == 1, "第二次應走 url_cache，不再呼叫瀏覽器"
+    db.x("DELETE FROM url_cache WHERE short_url LIKE 'https://test-short%'")
+    print("browser-resolve OK: 短網址經瀏覽器解析→valid，快取後免瀏覽器")
+
+    # ---- unit: url_cache 消毒（0801：毒條目忽略、非蝦皮不入快取）----------
+    db.x("INSERT OR REPLACE INTO url_cache(short_url, final_url, resolved_at) VALUES(?,?,?)",
+         ("https://test-short.example/poison", "https://test-short.example/poison", db.now()))
+    orig_get = linkparse.requests.get
+
+    class _FakeResp:
+        def __init__(self, url):
+            self.url, self.text = url, ""
+    try:
+        linkparse.requests.get = lambda *a, **kw: _FakeResp("https://other.example/final")
+        got = linkparse.resolve_url("https://test-short.example/poison")
+        assert got == "https://other.example/final", got  # 毒快取（short→short）被忽略，走真解析
+        assert db.q1("SELECT 1 FROM url_cache WHERE short_url=?",
+                     ("https://other.example/final",)) is None
+        row = db.q1("SELECT final_url FROM url_cache WHERE short_url=?",
+                    ("https://test-short.example/poison",))
+        assert row["final_url"] == "https://test-short.example/poison", "非蝦皮 final 不得入快取"
+    finally:
+        linkparse.requests.get = orig_get
+    db.x("DELETE FROM url_cache WHERE short_url LIKE 'https://test-short%'")
+    print("url_cache hygiene OK: 毒條目忽略、非蝦皮不入快取")
+
+    # ---- variant_error → sold out；抓取例外 → error → link error（0801）--
+    reset()
+    rows = links_by_row()
+    setup_pdp(fake, rows)
+    it26v, it27v = rows[26]["itemid"], rows[27]["itemid"]
+    fake.pdp[it26v] = {"exists": True, "unlisted": False, "title": "t", "shop_name": "s",
+                       "images": [], "item_status": "normal",
+                       "models": [{"model_id": 1, "name": "AAA", "price_idr": 100, "stock": None,
+                                   "in_stock": True, "image": None},
+                                  {"model_id": 2, "name": "BBB", "price_idr": 200, "stock": None,
+                                   "in_stock": True, "image": None}]}
+    fake.pdp_raise.add(it27v)
+    try:
+        job_id = jobs.create_job("check", {"product_codes": [CODE]})
+        assert run_job_to_completion(job_id) == "done"
+        rows = links_by_row()
+        assert rows[26]["status"] == "variant_error", rows[26]["status"]
+        assert rows[27]["status"] == "error", rows[27]["status"]
+        assert web.ui_status(rows[26]) == "invalid" and web.ui_status(rows[27]) == "invalid"
+        notes = {db.jload(w["payload_json"]).get("note") for w in db.q(
+            "SELECT * FROM pending_writes WHERE product_code=? AND kind='set_note'", (CODE,))}
+        assert "sold out" in notes and "link error" in notes, notes
+    finally:
+        fake.pdp_raise.clear()
+    print("variant_error→sold out / error→link error OK（invalid 必有 Note）")
+
+    # ---- 孤兒 accepted 不吃補找名額 + 虛擬待寫入列（0801）-----------------
+    reset()
+    db.x("UPDATE links SET status='valid', last_price_idr=78000 "
+         "WHERE product_code=? AND sheet_row_hint IN (25,26)", (CODE,))
+    db.x("UPDATE links SET status='sold_out' WHERE product_code=? AND sheet_row_hint=27", (CODE,))
+    db.x("""INSERT INTO candidates(product_code, shopid, itemid, state, created_at)
+            VALUES(?, 2, 2, 'accepted', ?)""", (CODE, db.now()))  # 無 pending write 背書的孤兒
+    cfg._config["auto_accept_candidates"] = True
+    fake.search_results = [
+        {"itemid": 999001, "shopid": 555001, "title": "Skintific Low pH Cleanser 80ml murah",
+         "price_idr": 70000, "sold": 5000, "image": "s1", "shop_location": "Kota Tangerang", "is_ad": False},
+    ]
+    fake.pdp[999001] = {"exists": True, "unlisted": False, "title": "Skintific Low pH Cleanser 80ml murah",
+                        "shop_name": "TokoMurah", "images": ["n1"], "item_status": "normal",
+                        "models": [{"model_id": 777, "name": "LOW PH 80ml,Skintific",
+                                    "price_idr": 70000, "stock": None, "in_stock": True, "image": "n1a"}]}
+    job_id = jobs.create_job("find", {"product_codes": [CODE]})
+    assert run_job_to_completion(job_id) == "done"
+    orphan = db.q1("SELECT state FROM candidates WHERE product_code=? AND itemid=2", (CODE,))["state"]
+    assert orphan == "expired", orphan  # 舊邏輯 need=3-2-1=0 會 skip，孤兒必須先過期
+    acc = [dict(c) for c in db.q(
+        "SELECT * FROM candidates WHERE product_code=? AND state='accepted'", (CODE,))]
+    assert [c["itemid"] for c in acc] == [999001], acc
+    # 虛擬列：accepted + pending insert 寫入 → 出現在正式區資料，帶關鍵字
+    vrows = web.pending_candidate_rows(CODE)
+    assert len(vrows) == 1 and vrows[0]["virtual"] and vrows[0]["ui_status"] == "valid", vrows
+    assert (vrows[0]["search_keyword"] or "").strip(), "虛擬列需帶搜尋關鍵字"
+    # 寫入被丟棄 → 虛擬列消失
+    db.x("UPDATE pending_writes SET state='discarded' "
+         "WHERE product_code=? AND kind='insert_link_row'", (CODE,))
+    assert web.pending_candidate_rows(CODE) == []
+    # 寫入完成（candidate=written）也不顯示——由鏡射的真實列接手
+    db.x("UPDATE pending_writes SET state='pending' "
+         "WHERE product_code=? AND kind='insert_link_row'", (CODE,))
+    db.x("UPDATE candidates SET state='written' WHERE product_code=? AND itemid=999001", (CODE,))
+    assert web.pending_candidate_rows(CODE) == []
+    print("orphan-accepted expiry + virtual pending rows OK")
 
     # ---- crash-resume ----------------------------------------------------
     reset()

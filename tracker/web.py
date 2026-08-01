@@ -25,7 +25,7 @@ PRODUCT_SQL = """
 SELECT p.code, p.item_name, p.baseline_idr, p.high_cost_pct,
   COUNT(l.id) AS n_links,
   COALESCE(SUM(CASE WHEN l.status='valid' THEN 1 ELSE 0 END),0) AS n_valid,
-  COALESCE(SUM(CASE WHEN l.status IN ('invalid','sold_out','unlisted','high_cost') THEN 1 ELSE 0 END),0) AS n_bad,
+  COALESCE(SUM(CASE WHEN l.status IN ('invalid','sold_out','unlisted','variant_error','high_cost') THEN 1 ELSE 0 END),0) AS n_bad,
   COALESCE(SUM(CASE WHEN l.status='error' THEN 1 ELSE 0 END),0) AS n_error,
   COALESCE(SUM(CASE WHEN l.status='unchecked' THEN 1 ELSE 0 END),0) AS n_unchecked,
   COALESCE(SUM(CASE WHEN l.status_detail LIKE 'note conflict%' THEN 1 ELSE 0 END),0) AS n_conflict,
@@ -67,7 +67,7 @@ def products():
 
 # UI 狀態二值化（客戶 2.1）：畫面只顯示 valid / invalid，細分原因在 Note 與
 # status_detail；unchecked 顯示中性標籤。內部 status 細分保留（復活判斷用）。
-UI_INVALID_STATUSES = {"invalid", "sold_out", "unlisted", "high_cost", "error"}
+UI_INVALID_STATUSES = {"invalid", "sold_out", "unlisted", "variant_error", "high_cost", "error"}
 
 
 def ui_status(link):
@@ -78,17 +78,67 @@ def ui_status(link):
     return "unchecked"
 
 
-def split_official(links, target=3):
-    """客戶 2.2：最新價最低的 target 條 valid = 正式連結；其餘 active 連結
-    （invalid + 第 4 名後的 valid）全部進備選區。純計算不落地——備選連結
-    復活且更便宜時，下次 render 自然重新排進正式區。"""
+def derived_note(link):
+    """0801 修正單：Note 欄以「當前判定」為真相來源，不顯示表上 I 欄舊值
+    （dry_run 下舊值永遠不更新，會出現 valid 卻掛 high cost 的矛盾）。"""
+    from .checker import NOTE_FOR_STATUS
+    return NOTE_FOR_STATUS.get(link["status"], "")
+
+
+def human_note(link):
+    """I 欄若是人工備註（非機器詞彙）則保留顯示；機器詞彙一律改由
+    derived_note 呈現，避免新舊判定不一致。"""
+    from .sheets import is_machine_note
+    raw = (link["note"] or "").strip()
+    return raw if raw and not is_machine_note(raw) else ""
+
+
+_PRICE_KEY = lambda l: (l["last_price_idr"] or l["price_idr"] or (1 << 62))
+
+
+def split_official(links, target=None):
+    """0801 修正單：正式連結 = 全部 valid（可超過目標數，例如備選區兩條復活
+    後 4 條 valid 就維持 4 條），依最新價升冪；備選區 = 其餘 active 連結
+    （invalid 各狀態 + unchecked）。純計算不落地。target 參數保留簽名相容。"""
     act = [l for l in links if l["active"]]
-    valid = sorted([l for l in act if l["status"] == "valid"],
-                   key=lambda l: (l["last_price_idr"] or l["price_idr"] or (1 << 62)))
-    official = valid[:target]
-    official_ids = {l["id"] for l in official}
-    backup = [l for l in act if l["id"] not in official_ids]
+    official = sorted([l for l in act if l["status"] == "valid"], key=_PRICE_KEY)
+    backup = [l for l in act if l["status"] != "valid"]
     return official, backup
+
+
+def pending_candidate_rows(code):
+    """已找到但尚未寫入表的候選 → 正式區虛擬列（帶「待寫入表」標籤）。
+    dry_run 期間也能看到補找結果與搜尋關鍵字。proposed 一律顯示；accepted
+    需仍有 pending 的 insert_link_row 背書（與 finder 的孤兒判定同一條件）。
+    寫入完成 state='written' 即消失，由鏡射出的真實列取代。"""
+    from . import linkparse
+    rows = db.q("""SELECT c.* FROM candidates c WHERE c.product_code=? AND (
+                     c.state='proposed' OR (c.state='accepted' AND EXISTS (
+                       SELECT 1 FROM pending_writes w
+                       WHERE w.kind='insert_link_row' AND w.state='pending'
+                         AND w.product_code=c.product_code
+                         AND w.dedupe_key = c.shopid || '.' || c.itemid)))""", (code,))
+    active_keys = {r["dedupe_key"] for r in db.q(
+        "SELECT dedupe_key FROM links WHERE product_code=? AND active=1 AND dedupe_key!=''",
+        (code,))}
+    out = []
+    for c in rows:
+        c = dict(c)
+        if f"{c['shopid']}.{c['itemid']}" in active_keys:
+            continue  # 已寫入並鏡射成真實列，避免雙顯示
+        out.append({
+            "id": f"cand-{c['id']}", "virtual": True, "sheet_row_hint": None,
+            "raw_url": None,
+            "canonical_url": linkparse.canonical_url(c["shopid"], c["itemid"], c["model_id"]),
+            "page_name": c["title"], "variant_text": c["variant_text"],
+            "supplier": c["shop_name"], "shop_location": c["shop_location"],
+            "sold": c["sold"], "price_idr": c["price_idr"],
+            "prev_price_idr": None, "last_price_idr": c["price_idr"],
+            "status": "valid", "ui_status": "valid", "status_detail": "",
+            "note": "", "search_keyword": c["search_keyword"],
+            "last_checked_at": c["created_at"], "active": 1,
+        })
+    return out
 
 
 @bp.get("/product/<path:code>")
@@ -102,9 +152,15 @@ def product(code):
         l["ui_status"] = ui_status(l)
     target = int(cfg.get("target_links_per_product"))
     official, backup = split_official(links, target)
-    inactive = [l for l in links if not l["active"]]
+    virtual = pending_candidate_rows(code)
+    n_real = len(official)
+    official = sorted(official + virtual, key=_PRICE_KEY)
+    for l in official + backup:
+        l["ui_note"] = derived_note(l)
+        l["human_note"] = human_note(l)
     return render_template("product.html", p=dict(prod), links=links,
-                           official=official, backup=backup, inactive=inactive,
+                           official=official, backup=backup,
+                           n_real=n_real, n_virtual=len(virtual),
                            target=target, global_pct=cfg.get("high_cost_pct"))
 
 

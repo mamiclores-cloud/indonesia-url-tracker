@@ -251,7 +251,10 @@ def parse_rows(rows):
             prev_code = code
         if not is_link_row(row):
             continue
-        raw_url = row["h_url"] or row["vals"]["H"].strip()
+        # 0801 修正單：儲存格顯示文字優先（客戶要求抓儲存格中的連結文字，
+        # 不抓附掛的短網址 hyperlink）；文字不是 URL 才退回 hyperlink/公式。
+        h_text = row["vals"]["H"].strip()
+        raw_url = h_text if h_text.startswith("http") else (row["h_url"] or h_text)
         links.append({
             "product_code": code,
             "sheet_row": row["row"],
@@ -322,7 +325,14 @@ def seed_baselines(parse_min=None):
 
 
 def sync_mirror(rows):
-    """Upsert parsed sheet rows into SQLite. Identity: (product_code, raw_url)."""
+    """Upsert parsed sheet rows into SQLite.
+
+    身分比對（0801 修正單）：先 (product_code, raw_url) 精確比對；沒中再用
+    dedupe_key（shopid.itemid）在同商品內找未匹配的舊列「就地更新 raw_url」——
+    同一儲存格在不同次拉取抽出的 URL 字串可能不同（hyperlink vs 文字、編碼
+    差異），不能因此把舊列當成已從表上刪除。最後做幻影收斂：同 dedupe_key
+    的殘餘 inactive 舊列併入本次匹配到的列（純 DB 整理，Sheet 永遠不動）。
+    """
     products, links, _ = parse_rows(rows)
     c = db.conn()
     with c:
@@ -334,29 +344,73 @@ def sync_mirror(rows):
         # Deactivate ALL links first, then reactivate whatever the sheet still
         # has. A 'found' link that was written to the sheet but later deleted by
         # a human must also drop to active=0 — otherwise it lingers as a phantom
-        # valid link and can be re-picked as a finder source. (Rows still present
-        # are re-added below as origin='sheet', active=1.)
+        # valid link and can be re-picked as a finder source. 本交易內
+        # active=1 == 本次拉取有匹配到，dedupe fallback 據此只認領 active=0 列。
         c.execute("UPDATE links SET active=0")
         for lk in links:
             enrich_link_ids(lk)
-            c.execute(
-                """INSERT INTO links(product_code, sheet_row_hint, raw_url, canonical_url,
-                     shopid, itemid, model_id, dedupe_key, page_name, variant_text,
-                     price_idr, supplier, note, active, origin)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,'sheet')
-                   ON CONFLICT(product_code, raw_url) DO UPDATE SET
-                     sheet_row_hint=excluded.sheet_row_hint,
-                     canonical_url=COALESCE(excluded.canonical_url, links.canonical_url),
-                     shopid=COALESCE(excluded.shopid, links.shopid),
-                     itemid=COALESCE(excluded.itemid, links.itemid),
-                     model_id=COALESCE(excluded.model_id, links.model_id),
-                     dedupe_key=CASE WHEN excluded.dedupe_key!='' THEN excluded.dedupe_key ELSE links.dedupe_key END,
-                     page_name=excluded.page_name, variant_text=excluded.variant_text,
-                     price_idr=excluded.price_idr, supplier=excluded.supplier,
-                     note=excluded.note, active=1, origin='sheet'""",
-                (lk["product_code"], lk["sheet_row"], lk["raw_url"], lk["canonical_url"],
-                 lk["shopid"], lk["itemid"], lk["model_id"], lk["dedupe_key"],
-                 lk["page_name"], lk["variant_text"], lk["price_idr"], lk["supplier"], lk["note"]))
+            row = c.execute("SELECT id FROM links WHERE product_code=? AND raw_url=?",
+                            (lk["product_code"], lk["raw_url"])).fetchone()
+            if row is None and lk["dedupe_key"]:
+                # 同商品同 dedupe_key 且未被本次認領的舊列 = 同一連結換了字串
+                # 表示 → 就地更新 raw_url（優先取有檢查歷史者、再最舊）。
+                # 精確比對沒中代表沒有列持有新 raw_url，這裡不會撞 UNIQUE。
+                row = c.execute(
+                    "SELECT id FROM links WHERE product_code=? AND dedupe_key=? AND active=0 "
+                    "ORDER BY (last_checked_at IS NULL), id LIMIT 1",
+                    (lk["product_code"], lk["dedupe_key"])).fetchone()
+                if row is not None:
+                    c.execute("UPDATE links SET raw_url=? WHERE id=?", (lk["raw_url"], row["id"]))
+            if row is not None:
+                c.execute(
+                    """UPDATE links SET sheet_row_hint=?,
+                         canonical_url=COALESCE(?, canonical_url),
+                         shopid=COALESCE(?, shopid), itemid=COALESCE(?, itemid),
+                         model_id=COALESCE(?, model_id),
+                         dedupe_key=CASE WHEN ?!='' THEN ? ELSE dedupe_key END,
+                         page_name=?, variant_text=?, price_idr=?, supplier=?,
+                         note=?, active=1, origin='sheet' WHERE id=?""",
+                    (lk["sheet_row"], lk["canonical_url"], lk["shopid"], lk["itemid"],
+                     lk["model_id"], lk["dedupe_key"], lk["dedupe_key"],
+                     lk["page_name"], lk["variant_text"], lk["price_idr"],
+                     lk["supplier"], lk["note"], row["id"]))
+            else:
+                c.execute(
+                    """INSERT INTO links(product_code, sheet_row_hint, raw_url, canonical_url,
+                         shopid, itemid, model_id, dedupe_key, page_name, variant_text,
+                         price_idr, supplier, note, active, origin)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,'sheet')""",
+                    (lk["product_code"], lk["sheet_row"], lk["raw_url"], lk["canonical_url"],
+                     lk["shopid"], lk["itemid"], lk["model_id"], lk["dedupe_key"],
+                     lk["page_name"], lk["variant_text"], lk["price_idr"], lk["supplier"], lk["note"]))
+        # 幻影收斂：同 (product_code, dedupe_key) 既有本次匹配到的列（active=1）
+        # 又有殘餘 inactive 舊列時，舊列只是同一連結的舊字串身分——把檢查歷史
+        # 併入倖存者後刪除 DB 列（Sheet 不動）。兩列都在表上（都 active=1）
+        # 絕不合併（同商品確實可能有兩列同款連結）；dedupe_key 空字串絕不合併。
+        dups = c.execute(
+            """SELECT product_code, dedupe_key FROM links WHERE dedupe_key!=''
+               GROUP BY product_code, dedupe_key
+               HAVING SUM(active)>=1 AND SUM(1-active)>=1""").fetchall()
+        for d in dups:
+            survivor = c.execute(
+                "SELECT id, status FROM links WHERE product_code=? AND dedupe_key=? AND active=1 "
+                "ORDER BY (last_checked_at IS NULL), id LIMIT 1",
+                (d["product_code"], d["dedupe_key"])).fetchone()
+            phantoms = c.execute(
+                "SELECT * FROM links WHERE product_code=? AND dedupe_key=? AND active=0",
+                (d["product_code"], d["dedupe_key"])).fetchall()
+            for ph in phantoms:
+                cur = c.execute("SELECT status FROM links WHERE id=?", (survivor["id"],)).fetchone()
+                if cur["status"] == "unchecked" and ph["last_checked_at"]:
+                    # 倖存者是改名後新建的空殼列時，把幻影的檢查歷史搬過來
+                    c.execute(
+                        """UPDATE links SET status=?, status_detail=?, last_price_idr=?,
+                             prev_price_idr=?, last_checked_at=?, shop_location=?, sold=?,
+                             search_keyword=COALESCE(search_keyword, ?) WHERE id=?""",
+                        (ph["status"], ph["status_detail"], ph["last_price_idr"],
+                         ph["prev_price_idr"], ph["last_checked_at"], ph["shop_location"],
+                         ph["sold"], ph["search_keyword"], survivor["id"]))
+                c.execute("DELETE FROM links WHERE id=?", (ph["id"],))
     # 新商品第一次進系統時定植基準價（此時表上價格必然是「查詢前」的）
     parse_min = {}
     for lk in links:
@@ -386,6 +440,25 @@ def is_machine_note(note: str) -> bool:
 
 def _col_range(ws, col, row):
     return f"{ws}!{col}{row}"
+
+
+def _insert_value_batch(ws, new_row, code, p):
+    """新插入列的 values:batchUpdate payload（純函式，供測試斷言）。
+    0801 修正單：I 欄不再寫「new」——valid 連結 Note 必須空白，插列後 I 本來就空。"""
+    h_formula = f'=HYPERLINK("{p["url"]}")'
+    batch = [
+        # A 欄填上同樣的 product code（使用者要求：找到的新列也要標明所屬商品）
+        {"range": f"{ws}!A{new_row}",
+         "values": [[p.get("product_code", code)]]},
+        {"range": f"{ws}!C{new_row}:E{new_row}",
+         "values": [[p.get("page_name", ""), p.get("variant_text", ""), p.get("price_idr")]]},
+        {"range": f"{ws}!G{new_row}:H{new_row}",
+         "values": [[p.get("supplier", ""), h_formula]]},
+    ]
+    # 客戶 1.2：把找此連結用的搜尋關鍵字寫在同列 L 欄供人工驗證
+    if p.get("search_keyword") and cfg.get("record_keyword_to_sheet", True):
+        batch.append({"range": f"{ws}!L{new_row}", "values": [[p["search_keyword"]]]})
+    return batch
 
 
 class Relocator:
@@ -527,22 +600,7 @@ def apply_writes(write_ids, progress=None):
             r1 = sess.post(f"{base}:batchUpdate", json={"requests": reqs}, timeout=60)
             r1.raise_for_status()
 
-            h_formula = f'=HYPERLINK("{p["url"]}")'
-            value_batch = [
-                # A 欄填上同樣的 product code（使用者要求：找到的新列也要標明所屬商品）
-                {"range": f"{ws}!A{new_row}",
-                 "values": [[p.get("product_code", code)]]},
-                {"range": f"{ws}!C{new_row}:E{new_row}",
-                 "values": [[p.get("page_name", ""), p.get("variant_text", ""), p.get("price_idr")]]},
-                {"range": f"{ws}!G{new_row}:H{new_row}",
-                 "values": [[p.get("supplier", ""), h_formula]]},
-                # 客戶 1.4：新找到的連結 Note 標「new」，下次檢查依狀態規則覆寫
-                {"range": f"{ws}!I{new_row}", "values": [["new"]]},
-            ]
-            # 客戶 1.2：把找此連結用的搜尋關鍵字寫在同列 L 欄供人工驗證
-            if p.get("search_keyword") and cfg.get("record_keyword_to_sheet", True):
-                value_batch.append({"range": f"{ws}!L{new_row}",
-                                    "values": [[p["search_keyword"]]]})
+            value_batch = _insert_value_batch(ws, new_row, code, p)
             r2 = sess.post(f"{base}/values:batchUpdate", json={
                 "valueInputOption": "USER_ENTERED", "data": value_batch}, timeout=60)
             r2.raise_for_status()
@@ -572,7 +630,7 @@ def apply_writes(write_ids, progress=None):
         reloc.shift_after(last)
         reloc.last_row[code] = new_row
         mark_written(w)
-        # mirror into links（note='new' 與地區/銷量/關鍵字帶入，待下次檢查以 PDP 值覆蓋）
+        # mirror into links（地區/銷量/關鍵字帶入，待下次檢查以 PDP 值覆蓋）
         db.x("""INSERT INTO links(product_code, sheet_row_hint, raw_url, canonical_url, shopid, itemid,
                   model_id, dedupe_key, page_name, variant_text, price_idr, supplier, note,
                   status, origin, active, last_checked_at, shop_location, sold, search_keyword)
@@ -580,7 +638,7 @@ def apply_writes(write_ids, progress=None):
                 ON CONFLICT(product_code, raw_url) DO UPDATE SET active=1, sheet_row_hint=excluded.sheet_row_hint""",
              (code, new_row, p["url"], p["url"], p.get("shopid"), p.get("itemid"),
               w["model_id"], w["dedupe_key"] or "", p.get("page_name", ""), p.get("variant_text", ""),
-              p.get("price_idr"), p.get("supplier", ""), "new", "valid", db.now(),
+              p.get("price_idr"), p.get("supplier", ""), "", "valid", db.now(),
               p.get("shop_location", ""), p.get("sold"), p.get("search_keyword", "")))
         if p.get("candidate_id"):
             db.x("UPDATE candidates SET state='written' WHERE id=?", (p["candidate_id"],))
