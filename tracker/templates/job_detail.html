@@ -20,8 +20,30 @@
     <a href="/review"><button type="button">前往審核寫入</button></a>
   </div>
 </section>
+<form class="toolbar" method="get" action="/jobs/{{ job.id }}">
+  <select name="kind">
+    <option value="">全部類型</option>
+    {% for k in ['fetch_link', 'classify_product', 'find_links', 'apply_writes'] %}
+      {% if by_kind.get(k) %}
+      <option value="{{ k }}" {% if flt.kind==k %}selected{% endif %}>{{ k }}（{{ by_kind[k] }}）</option>
+      {% endif %}
+    {% endfor %}
+  </select>
+  <select name="state">
+    <option value="">全部狀態</option>
+    {% for s in ['pending', 'running', 'done', 'failed'] %}
+      {% if by_state.get(s) %}
+      <option value="{{ s }}" {% if flt.state==s %}selected{% endif %}>{{ s }}（{{ by_state[s] }}）</option>
+      {% endif %}
+    {% endfor %}
+  </select>
+  <button>篩選</button>
+  {% if by_state.get('failed') and flt.state != 'failed' %}
+  <a href="?state=failed"><button type="button" class="warn">只看失敗（{{ by_state['failed'] }}）</button></a>
+  {% endif %}
+</form>
 <section class="card">
-<h2>項目（失敗優先，最新 300 筆）</h2>
+<h2>項目（失敗優先，篩選結果 {{ total }} 筆）</h2>
 <table>
 <thead><tr><th>#</th><th>類型</th><th>對象</th><th>狀態</th><th>結果</th></tr></thead>
 <tbody>
@@ -36,6 +58,12 @@
 {% endfor %}
 </tbody>
 </table>
+<div class="pager">
+  {% set qs = 'kind=' ~ flt.kind ~ '&state=' ~ flt.state %}
+  {% if page > 1 %}<a href="?{{ qs }}&page={{ page-1 }}">‹ 上一頁</a>{% endif %}
+  第 {{ page }} / {{ pages if pages else 1 }} 頁
+  {% if page < pages %}<a href="?{{ qs }}&page={{ page+1 }}">下一頁 ›</a>{% endif %}
+</div>
 </section>
 {% endblock %}
 {% block scripts %}
@@ -44,6 +72,9 @@ async function jobAction(action) {
   await api(`/api/jobs/{{ job.id }}/${action}`, {});
   location.reload();
 }
-{% if job.state in ('running','pending') %}setInterval(() => location.reload(), 5000);{% endif %}
+// 執行中才自動刷新，且只在第一頁——翻頁瀏覽時不該被拉回頁首
+{% if job.state in ('running','pending') %}
+if ({{ page }} === 1) setInterval(() => location.reload(), 5000);
+{% endif %}
 </script>
 {% endblock %}

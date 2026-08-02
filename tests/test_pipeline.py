@@ -475,6 +475,115 @@ def main():
     assert stale == "expired", stale
     print("stale candidate expiry OK")
 
+    # ---- 補找價格上限：超過 high cost 門檻的候選不採用（0802）--------------
+    reset()
+    db.x("UPDATE products SET baseline_idr=78000, high_cost_pct=10 WHERE code=?", (CODE,))
+    db.x("UPDATE links SET status='valid', last_price_idr=78000 WHERE product_code=? AND sheet_row_hint=25", (CODE,))
+    db.x("UPDATE links SET status='sold_out' WHERE product_code=? AND sheet_row_hint IN (26,27)", (CODE,))
+    cfg._config["auto_accept_candidates"] = False
+    fake.search_results = [
+        # 清單價已超過 78000×1.1=85800 → 連 PDP 都不該載入
+        {"itemid": 777001, "shopid": 333001, "title": "Skintific Low pH Cleanser 80ml",
+         "price_idr": 99000, "sold": 8000, "image": "p1", "shop_location": "Kota Tangerang", "is_ad": False},
+        # 清單價過關但實際規格價超標 → PDP 確認後仍不採用
+        {"itemid": 777002, "shopid": 333002, "title": "Skintific Low pH Cleanser 80ml",
+         "price_idr": 70000, "sold": 8000, "image": "p2", "shop_location": "Kota Tangerang", "is_ad": False},
+        # 完全合格
+        {"itemid": 777003, "shopid": 333003, "title": "Skintific Low pH Cleanser 80ml",
+         "price_idr": 71000, "sold": 8000, "image": "p3", "shop_location": "Kota Tangerang", "is_ad": False},
+    ]
+    for iid, mprice in ((777001, 99000), (777002, 90000), (777003, 71000)):
+        fake.pdp[iid] = {"exists": True, "unlisted": False, "title": "Skintific Low pH Cleanser 80ml",
+                         "shop_name": f"Shop{iid}", "images": ["p"], "item_status": "normal",
+                         "models": [{"model_id": None, "name": "LOW PH 80ml,Skintific",
+                                     "price_idr": mprice, "stock": None, "in_stock": True, "image": "pa"}]}
+    fake.pdp_calls.clear()
+    job_id = jobs.create_job("find", {"product_codes": [CODE]})
+    assert run_job_to_completion(job_id) == "done"
+    got = {c["itemid"] for c in db.q(
+        "SELECT itemid FROM candidates WHERE product_code=? AND state='proposed'", (CODE,))}
+    assert got == {777003}, got                       # 只採用門檻內的
+    assert 777001 not in fake.pdp_calls, "清單價超標者不該載入 PDP"
+    assert 777002 in fake.pdp_calls, "清單價過關者仍需 PDP 確認"
+    res = db.jload(db.q1("SELECT result_json FROM job_items WHERE job_id=? AND kind='find_links'",
+                         (job_id,))["result_json"], {})
+    # need=2 但只有 1 個合格候選 → 會再往下一個地區層級找，超標者每層各記一次
+    assert res["price_cap"] == 85800 and res["over_price_cap"] >= 2, res
+    print("price cap OK: 清單價預篩 + 規格價複檢，只留門檻內候選")
+
+    # ---- 單商品補找時間上限（0802）---------------------------------------
+    reset()
+    db.x("UPDATE products SET baseline_idr=78000 WHERE code=?", (CODE,))
+    db.x("UPDATE links SET status='sold_out' WHERE product_code=?", (CODE,))
+    cfg._config["find_time_budget_s"] = -1             # 期限已過，必定在第一個檢查點收工
+    try:
+        job_id = jobs.create_job("find", {"product_codes": [CODE]})
+        assert run_job_to_completion(job_id) == "done"   # 超時不是失敗，正常收工
+        res = db.jload(db.q1("SELECT result_json FROM job_items WHERE job_id=? AND kind='find_links'",
+                             (job_id,))["result_json"], {})
+        assert res.get("time_budget_hit") and "時間上限" in res.get("note", ""), res
+        assert res["pdp_confirms"] == 0
+    finally:
+        cfg._config["find_time_budget_s"] = 240
+    print("find time budget OK: 超時即收工並標註，任務不中斷")
+
+    # ---- pacing 安全網（0802）--------------------------------------------
+    assert shopee.safe_pacing_until() is None
+    shopee.enter_safe_pacing("測試")
+    assert shopee.safe_pacing_until(), "偵測到阻擋後應進入保守節奏"
+    drv = shopee.ShopeeDriver()
+    import unittest.mock
+    with unittest.mock.patch("tracker.shopee.time.sleep") as slept:
+        drv._pace()
+    assert slept.call_args[0][0] >= shopee.SAFE_PACING["min_delay_s"], slept.call_args
+    db.x("DELETE FROM settings WHERE key='pacing_safe_until'")
+    assert shopee.safe_pacing_until() is None
+    print("safe pacing OK: 阻擋後自動退回保守值、到期自動恢復")
+
+    # ---- Sheets API 節流與重試（0802）------------------------------------
+    calls = []
+
+    class R:
+        def __init__(self, code): self.status_code = code
+    seq = [R(429), R(503), R(200)]
+    with unittest.mock.patch("tracker.sheets.time.sleep") as slept:
+        r = sheets.api_call(lambda *a, **k: (calls.append(a), seq.pop(0))[1], "url")
+    assert r.status_code == 200 and len(calls) == 3, (r.status_code, len(calls))
+    assert [c[0][0] for c in slept.call_args_list] == [2.0, 4.0], slept.call_args_list
+    print("sheets api_call OK: 429/5xx 指數退避後成功")
+
+    # ---- 審核頁 API：filter 沒命中絕不可退回「套用全部」（0802）------------
+    from tracker import create_app
+    app = create_app(start_worker=False)
+    cl = app.test_client()
+    n_all = db.q1("SELECT COUNT(*) n FROM pending_writes WHERE state='pending'")["n"]
+    rv = cl.post("/api/writes/apply", json={"filter": {"q": "NO_SUCH_CODE_XYZ"}})
+    assert rv.status_code == 400 and not rv.get_json()["ok"], rv.get_json()
+    rv = cl.post("/api/writes/discard", json={"filter": {"q": "NO_SUCH_CODE_XYZ"}})
+    assert rv.get_json()["discarded"] == 0, rv.get_json()
+    assert db.q1("SELECT COUNT(*) n FROM pending_writes WHERE state='pending'")["n"] == n_all
+    # 分頁與篩選一致性：各頁筆數加總 == 篩選總數
+    import re as _re
+    body = cl.get("/review?kind=set_note").get_data(as_text=True)
+    total = int(_re.search(r"篩選結果 (\d+) 筆", body).group(1))
+    pages = int(_re.search(r"第 \d+ / (\d+) 頁", body).group(1))
+    seen = sum(cl.get(f"/review?kind=set_note&page={p}").get_data(as_text=True).count('class="sel"')
+               for p in range(1, pages + 1))
+    n_set_note = db.q1("SELECT COUNT(*) n FROM pending_writes WHERE kind='set_note' AND state='pending'")["n"]
+    assert total == seen == n_set_note, (total, seen, n_set_note)
+    print(f"review API OK: filter 空集合不誤觸全部；分頁涵蓋 {seen} 筆無重複遺漏")
+
+    # ---- 分頁夾頁：超出範圍停在最後一頁，不出現空表（0802）----------------
+    for url in ("/products?page=999", "/review?page=999", "/jobs?page=999"):
+        body = cl.get(url).get_data(as_text=True)
+        cur, last = _re.search(r"第 (\d+) / (\d+) 頁", body).groups()
+        assert cur == last, (url, cur, last)
+    jid = db.q1("SELECT id FROM jobs ORDER BY id DESC LIMIT 1")["id"]
+    body = cl.get(f"/jobs/{jid}?page=999").get_data(as_text=True)
+    cur, last = _re.search(r"第 (\d+) / (\d+) 頁", body).groups()
+    assert cur == last, (cur, last)
+    print("pagination clamp OK: 四個列表頁超出範圍都停在最後一頁")
+
     # ---- single-variant candidate → D = "-", URL without display_model_id -
     reset()
     db.x("UPDATE links SET status='valid', last_price_idr=78000 WHERE product_code=? AND sheet_row_hint=25", (CODE,))

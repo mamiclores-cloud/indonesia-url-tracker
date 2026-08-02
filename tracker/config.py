@@ -22,12 +22,17 @@ DEFAULTS = {
     "min_sold": 100,
     "image_sim_threshold": 0.6,
     "target_links_per_product": 3,
+    # 單一商品補找的牆鐘上限（秒）。到點就用已補到的收工，剩下的下次再補，
+    # 避免個別難找的商品把整批掃描拖住。
+    "find_time_budget_s": 240,
     "dry_run": False,
     "auto_accept_candidates": True,
     "record_keyword_to_sheet": True,
     "chrome_path": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "chrome_debug_port": 9222,
-    "pacing": {"min_delay_s": 3, "max_delay_s": 8, "long_pause_every": 25, "long_pause_s": 60},
+    # 實測 22 小時 5,450 次導覽在 3-8s/25/60s 下零驗證碼，故放寬到此節奏；
+    # 一旦被出驗證碼，shopee.enter_safe_pacing 會自動退回保守值 6 小時。
+    "pacing": {"min_delay_s": 1, "max_delay_s": 3, "long_pause_every": 50, "long_pause_s": 30},
     # City-level names only — Shopee's location filter and shop_location fields
     # are city-level, so region names like "Jabodetabek"/"Jawa Barat" match
     # nothing and waste a whole tier. Ordered inner→outer from Jakarta; last

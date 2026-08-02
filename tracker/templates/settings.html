@@ -36,6 +36,12 @@
     <label>最低銷量門檻<input id="f-sold" type="number" value="{{ cfg.min_sold }}"></label>
     <label>圖片相似度門檻 (0–1)<input id="f-sim" type="number" step="0.01" min="0" max="1" value="{{ cfg.image_sim_threshold }}"></label>
     <label>每商品目標有效連結數<input id="f-target" type="number" value="{{ cfg.target_links_per_product }}"></label>
+    <label>單商品補找時間上限（秒，0＝不限）
+      <input id="f-budget" type="number" value="{{ cfg.find_time_budget_s }}"></label>
+    <label>每次操作最短等待（秒）<input id="f-pmin" type="number" step="0.5" value="{{ cfg.pacing.min_delay_s }}"></label>
+    <label>每次操作最長等待（秒）<input id="f-pmax" type="number" step="0.5" value="{{ cfg.pacing.max_delay_s }}"></label>
+    <label>每 N 次操作長暫停<input id="f-pevery" type="number" value="{{ cfg.pacing.long_pause_every }}"></label>
+    <label>長暫停秒數<input id="f-plong" type="number" value="{{ cfg.pacing.long_pause_s }}"></label>
     <label>Dry-run（寫入前需審核）
       <select id="f-dry"><option value="0" {% if not cfg.dry_run %}selected{% endif %}>關（自動寫入，建議）</option>
       <option value="1" {% if cfg.dry_run %}selected{% endif %}>開（測試用）</option></select></label>
@@ -98,6 +104,13 @@ async function saveCfg() {
     min_sold: document.getElementById('f-sold').value,
     image_sim_threshold: document.getElementById('f-sim').value,
     target_links_per_product: document.getElementById('f-target').value,
+    find_time_budget_s: document.getElementById('f-budget').value,
+    pacing: {
+      min_delay_s: +document.getElementById('f-pmin').value,
+      max_delay_s: +document.getElementById('f-pmax').value,
+      long_pause_every: +document.getElementById('f-pevery').value,
+      long_pause_s: +document.getElementById('f-plong').value,
+    },
     dry_run: document.getElementById('f-dry').value === '1',
     auto_accept_candidates: document.getElementById('f-auto').value === '1',
     record_keyword_to_sheet: document.getElementById('f-kw').value === '1',

@@ -34,6 +34,7 @@ async function pollStatus() {
     parts.push(s.chrome.chrome_alive ? 'Chrome ✅' : 'Chrome ⚫');
     parts.push(s.google.ok ? 'Google ✅' : 'Google ⚫');
     parts.push(s.dry_run ? 'dry-run' : '⚠️ 直接寫入');
+    if (s.pacing_safe_until) parts.push(`🐢 保守節奏至 ${s.pacing_safe_until.slice(5, 16)}`);
     if (s.job) parts.push(`任務#${s.job.id} ${s.job.state} ${s.job.progress_done}/${s.job.progress_total}`);
     bar.textContent = parts.join('　');
   }

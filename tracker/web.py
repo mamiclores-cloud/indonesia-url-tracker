@@ -42,7 +42,6 @@ GROUP BY p.code ORDER BY p.code
 def products():
     q = (request.args.get("q") or "").strip().lower()
     flt = request.args.get("filter") or ""
-    page = max(1, int(request.args.get("page", 1)))
     per = 200
     rows = [dict(r) for r in db.q(PRODUCT_SQL)]
     if q:
@@ -59,9 +58,10 @@ def products():
     elif flt == "bad":
         rows = [r for r in rows if r["n_bad"] > 0]
     total = len(rows)
-    rows = rows[(page - 1) * per: page * per]
+    pages, page, off = _paginate(total, per, int(request.args.get("page", 1)))
+    rows = rows[off: off + per]
     return render_template("products.html", rows=rows, q=q, flt=flt,
-                           page=page, pages=(total + per - 1) // per, total=total,
+                           page=page, pages=pages, total=total,
                            target=int(cfg.get("target_links_per_product")))
 
 
@@ -164,10 +164,26 @@ def product(code):
                            target=target, global_pct=cfg.get("high_cost_pct"))
 
 
+def _paginate(total, per, requested):
+    """(頁數, 夾在有效範圍內的頁碼, offset)。超出範圍就停在最後一頁，
+    不要顯示「第 99 / 6 頁」加一張空表。"""
+    pages = (total + per - 1) // per
+    page = min(max(1, requested), pages) if pages else 1
+    return pages, page, (page - 1) * per
+
+
 @bp.get("/jobs")
 def jobs_page():
-    rows = [dict(r) for r in db.q("SELECT * FROM jobs ORDER BY id DESC LIMIT 50")]
-    return render_template("jobs.html", rows=rows)
+    per = 50
+    total = db.q1("SELECT COUNT(*) n FROM jobs")["n"]
+    pages, page, off = _paginate(total, per, int(request.args.get("page", 1)))
+    rows = [dict(r) for r in db.q(
+        "SELECT * FROM jobs ORDER BY id DESC LIMIT ? OFFSET ?", (per, off))]
+    return render_template("jobs.html", rows=rows, page=page, total=total, pages=pages)
+
+
+ITEM_KINDS = ("fetch_link", "classify_product", "find_links", "apply_writes")
+ITEM_STATES = ("pending", "running", "done", "failed")
 
 
 @bp.get("/jobs/<int:job_id>")
@@ -175,21 +191,80 @@ def job_detail(job_id):
     job = db.q1("SELECT * FROM jobs WHERE id=?", (job_id,))
     if job is None:
         return "無此任務", 404
+    per = 200
+    kind = request.args.get("kind") or ""
+    state = request.args.get("state") or ""
+    where, params = ["job_id=?"], [job_id]
+    if kind in ITEM_KINDS:
+        where.append("kind=?")
+        params.append(kind)
+    if state in ITEM_STATES:
+        where.append("state=?")
+        params.append(state)
+    where = " AND ".join(where)
+    total = db.q1(f"SELECT COUNT(*) n FROM job_items WHERE {where}", params)["n"]
+    pages, page, off = _paginate(total, per, int(request.args.get("page", 1)))
+    # 失敗優先仍是預設排序（要先看到問題），分頁在同一個排序上切
     items = [dict(r) for r in db.q(
-        "SELECT * FROM job_items WHERE job_id=? ORDER BY (state='failed') DESC, id DESC LIMIT 300",
-        (job_id,))]
-    return render_template("job_detail.html", job=dict(job), items=items)
+        f"SELECT * FROM job_items WHERE {where} ORDER BY (state='failed') DESC, id DESC "
+        f"LIMIT ? OFFSET ?", params + [per, off])]
+    counts = {(r["kind"], r["state"]): r["n"] for r in db.q(
+        "SELECT kind, state, COUNT(*) n FROM job_items WHERE job_id=? GROUP BY kind, state",
+        (job_id,))}
+    by_kind, by_state = {}, {}
+    for (k, s), n in counts.items():
+        by_kind[k] = by_kind.get(k, 0) + n
+        by_state[s] = by_state.get(s, 0) + n
+    return render_template("job_detail.html", job=dict(job), items=items,
+                           page=page, pages=pages, total=total,
+                           flt={"kind": kind, "state": state},
+                           by_kind=by_kind, by_state=by_state)
+
+
+WRITE_KINDS = ("update_price", "set_note", "clear_note", "insert_link_row")
+
+
+def _write_filters(args):
+    """審核頁的篩選條件 → (where 片段, 參數)。同一組條件同時給列表、計數與
+    「套用目前篩選的全部」使用，三者才不會各算各的。"""
+    where, params = ["state IN ('pending','failed')"], []
+    kind = args.get("kind") or ""
+    state = args.get("state") or ""
+    q = (args.get("q") or "").strip()
+    if kind in WRITE_KINDS:
+        where.append("kind=?")
+        params.append(kind)
+    if state in ("pending", "failed"):
+        where.append("state=?")
+        params.append(state)
+    if q:
+        where.append("product_code LIKE ?")
+        params.append(f"%{q}%")
+    return " AND ".join(where), params, {"kind": kind, "state": state, "q": q}
 
 
 @bp.get("/review")
 def review():
+    per = 200
+    where, params, flt = _write_filters(request.args)
+    total = db.q1(f"SELECT COUNT(*) n FROM pending_writes WHERE {where}", params)["n"]
+    pages, page, off = _paginate(total, per, int(request.args.get("page", 1)))
+    n_pending = db.q1(f"SELECT COUNT(*) n FROM pending_writes WHERE {where} AND state='pending'",
+                      params)["n"]
     writes = [dict(r) for r in db.q(
-        "SELECT * FROM pending_writes WHERE state IN ('pending','failed') ORDER BY id DESC LIMIT 500")]
+        f"SELECT * FROM pending_writes WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+        params + [per, off])]
     for w in writes:
         w["payload"] = db.jload(w["payload_json"], {})
     cands = [dict(r) for r in db.q(
         "SELECT * FROM candidates WHERE state='proposed' ORDER BY product_code, price_idr LIMIT 300")]
-    return render_template("review.html", writes=writes, cands=cands)
+    counts = {r["kind"]: r["n"] for r in db.q(
+        "SELECT kind, COUNT(*) n FROM pending_writes WHERE state='pending' GROUP BY kind")}
+    return render_template("review.html", writes=writes, cands=cands, flt=flt,
+                           page=page, pages=pages, total=total,
+                           n_pending=n_pending, counts=counts,
+                           all_pending=db.q1(
+                               "SELECT COUNT(*) n FROM pending_writes WHERE state='pending'")["n"])
 
 
 @bp.get("/settings")
@@ -215,6 +290,7 @@ def api_status():
         "last_sync": db.setting_get("last_sync_at"),
         "pending_writes": n_pending_writes,
         "proposed_candidates": n_proposed,
+        "pacing_safe_until": shopee.safe_pacing_until(),
         "sync": dict(_sync_state),
     })
 
@@ -294,9 +370,20 @@ def api_baseline(code):
 
 @bp.post("/api/writes/apply")
 def api_writes_apply():
+    """ids / filter / 兩者皆無（＝全部待寫入）三選一。
+
+    注意：帶了 filter 卻沒命中時必須直接回錯，絕不可退回「套用全部」——
+    那會把使用者以為只有幾筆的操作變成整批寫入 Sheet。
+    """
     data = request.get_json(force=True) if request.data else {}
     ids = data.get("ids")
-    if not ids:
+    if not ids and "filter" in data:
+        where, params, _ = _write_filters(data["filter"])
+        ids = [r["id"] for r in db.q(
+            f"SELECT id FROM pending_writes WHERE {where} AND state='pending'", params)]
+        if not ids:
+            return jsonify({"ok": False, "error": "篩選結果沒有可套用的項目"}), 400
+    elif not ids:
         ids = [r["id"] for r in db.q("SELECT id FROM pending_writes WHERE state='pending'")]
     if not ids:
         return jsonify({"ok": False, "error": "沒有待寫入項目"}), 400
@@ -308,9 +395,15 @@ def api_writes_apply():
 def api_writes_discard():
     data = request.get_json(force=True)
     ids = data.get("ids") or []
+    if not ids and data.get("filter"):
+        # 跨頁全選捨棄：與列表同一組條件，只動 pending（failed 留著給人看原因）
+        where, params, _ = _write_filters(data["filter"])
+        n = db.x(f"UPDATE pending_writes SET state='discarded' "
+                 f"WHERE {where} AND state='pending'", params).rowcount
+        return jsonify({"ok": True, "discarded": n})
     if ids:
         db.x(f"UPDATE pending_writes SET state='discarded' WHERE id IN ({','.join('?'*len(ids))})", ids)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "discarded": len(ids)})
 
 
 @bp.post("/api/candidates/<int:cand_id>/<action>")
@@ -362,11 +455,12 @@ def api_config():
                "auto_accept_candidates", "record_keyword_to_sheet",
                "worksheet_name", "sheet_id", "chrome_path",
                "idr_per_twd_divisor", "target_links_per_product", "pacing",
-               "search_locations_param"}
+               "find_time_budget_s", "search_locations_param"}
     updates = {k: v for k, v in data.items() if k in allowed}
     if "high_cost_pct" in updates:
         updates["high_cost_pct"] = float(updates["high_cost_pct"])
-    for k in ("min_sold", "target_links_per_product", "idr_per_twd_divisor"):
+    for k in ("min_sold", "target_links_per_product", "idr_per_twd_divisor",
+              "find_time_budget_s"):
         if k in updates:
             updates[k] = int(updates[k])
     if "image_sim_threshold" in updates:

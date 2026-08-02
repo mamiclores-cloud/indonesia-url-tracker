@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>任務</h1>
+<h1>任務 <small>{{ total }} 筆</small></h1>
 <table>
 <thead><tr><th>#</th><th>類型</th><th>狀態</th><th>進度</th><th>訊息</th><th>建立</th><th></th></tr></thead>
 <tbody>
@@ -25,6 +25,11 @@
 {% endfor %}
 </tbody>
 </table>
+<div class="pager">
+  {% if page > 1 %}<a href="?page={{ page-1 }}">‹ 上一頁</a>{% endif %}
+  第 {{ page }} / {{ pages if pages else 1 }} 頁
+  {% if page < pages %}<a href="?page={{ page+1 }}">下一頁 ›</a>{% endif %}
+</div>
 {% endblock %}
 {% block scripts %}
 <script>
@@ -32,6 +37,7 @@ async function jobAction(id, action) {
   await api(`/api/jobs/${id}/${action}`, {});
   location.reload();
 }
-setInterval(() => location.reload(), 10000);
+// 只有第一頁自動刷新，翻頁時不被拉回
+if ({{ page }} === 1) setInterval(() => location.reload(), 10000);
 </script>
 {% endblock %}

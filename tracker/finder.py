@@ -6,6 +6,7 @@ import difflib
 import json
 import logging
 import re
+import time
 
 from . import checker
 from . import config as cfg
@@ -227,6 +228,8 @@ def run_find_links(job, item):
     sim_threshold = float(db.setting_get("image_sim_calibrated") or cfg.get("image_sim_threshold"))
     drv = shopee.get_driver()
 
+    deadline = time.monotonic() + float(cfg.get("find_time_budget_s") or 0 or 1e9)
+
     n_valid = db.q1("SELECT COUNT(*) AS n FROM links WHERE product_code=? AND active=1 AND status='valid'",
                     (code,))["n"]
     # 客戶 Q&A：缺幾補幾。殘留的舊 proposed 候選會佔用名額（造成「缺 1 找 3」
@@ -297,11 +300,23 @@ def run_find_links(job, item):
     seen_cand = {f'{r["shopid"]}.{r["itemid"]}' for r in db.q(
         "SELECT shopid, itemid FROM candidates WHERE product_code=? AND state!='expired'", (code,))}
 
-    summary = {"attempts": [], "proposed": 0, "keyword_only": keyword_only}
+    # 0802：補找只收「補上去就會是 valid」的連結——價格超過 high cost 門檻的
+    # 候選寫進表後下次檢查必然變 high_cost 掉回備選區（實測占已採用候選 31%）。
+    # 搜尋清單價是該賣場最低規格價，是實際規格價的下界，連它都超標就一定超標。
+    baseline = checker.effective_baseline(code)
+    pct = checker.high_cost_pct(code)
+    price_cap = baseline * (1 + pct / 100.0) if baseline else None
+
+    summary = {"attempts": [], "proposed": 0, "keyword_only": keyword_only,
+               "price_cap": int(price_cap) if price_cap else None}
     proposed = 0
     pdp_confirms = 0        # bound total PDP navigations so a run can't drag on
+    over_cap = 0            # 因價格超過門檻而略過的候選數（觀察用）
 
     for attempt in (1, 2):
+        if time.monotonic() > deadline:
+            summary["time_budget_hit"] = True
+            break
         kw = build_keyword(src_title, src_variant, attempt, brand=src_brand)
         if not kw:
             continue
@@ -317,6 +332,9 @@ def run_find_links(job, item):
         keyword_bad = False
 
         for tier_idx, tier in enumerate(cfg.get("location_tiers")):
+            if time.monotonic() > deadline:
+                summary["time_budget_hit"] = True
+                break
             results, _raw = drv.search(kw, _locations_for_tier(tier))
             tier_log = {"tier": tier_idx, "results": len(results), "passed": 0}
             attempt_log["tiers"].append(tier_log)
@@ -368,6 +386,10 @@ def run_find_links(job, item):
                      and (r["sold"] or 0) >= min_sold
                      and r.get("price_idr")
                      and not r.get("is_sold_out")]
+            if price_cap:
+                keep = [r for r in cands if r["price_idr"] <= price_cap]
+                over_cap += len(cands) - len(keep)
+                cands = keep
             # Confirm order: by similarity band first (most-likely-genuine),
             # cheapest within each band. A low inclusion threshold otherwise
             # floods the pool with loose matches and the cheapest-first rule
@@ -381,6 +403,9 @@ def run_find_links(job, item):
             for r in cands[:max(need * 3, 4)]:
                 if proposed >= need or pdp_confirms >= MAX_PDP_CONFIRMS:
                     break
+                if time.monotonic() > deadline:
+                    summary["time_budget_hit"] = True
+                    break
                 url = linkparse.canonical_url(r["shopid"], r["itemid"])
                 pdp_confirms += 1
                 parsed, _ = drv.get_pdp(url)
@@ -388,6 +413,10 @@ def run_find_links(job, item):
                     continue
                 model, how = checker.match_variant(src_variant, parsed["models"], allow_single_model=True)
                 if model is None or not model.get("price_idr") or model.get("in_stock") is False:
+                    continue
+                # 實際選到的規格價才是會回填 E 欄的價；超過門檻就不採用
+                if price_cap and model["price_idr"] > price_cap:
+                    over_cap += 1
                     continue
                 # D 欄：只有 1 個 model = 沒有可選規格 → "-"（SPEC：無選項顯示 -）；
                 # 內部 model 名（如空字串或「SKINTIFIC EYE CREAM」）不是使用者可選項目
@@ -412,10 +441,16 @@ def run_find_links(job, item):
 
     summary["proposed"] = proposed
     summary["pdp_confirms"] = pdp_confirms
+    summary["over_price_cap"] = over_cap
     if proposed == 0:
         db.x("UPDATE products SET updated_at=? WHERE code=?", (db.now(), code))
-        summary["note"] = ("關鍵字比對失敗，需人工設定關鍵字" if keyword_bad
-                           else "第一頁無合格結果")
+        if summary.get("time_budget_hit"):
+            summary["note"] = f"達單商品時間上限（{cfg.get('find_time_budget_s')} 秒），下次執行再補"
+        elif over_cap and not keyword_bad:
+            summary["note"] = f"第一頁結果都超過 high cost 門檻（略過 {over_cap} 個）"
+        else:
+            summary["note"] = ("關鍵字比對失敗，需人工設定關鍵字" if keyword_bad
+                               else "第一頁無合格結果")
     if cfg.get("auto_accept_candidates"):
         for r in db.q("SELECT id FROM candidates WHERE product_code=? AND state='proposed'", (code,)):
             accept_candidate(r["id"], job_id=job["id"])

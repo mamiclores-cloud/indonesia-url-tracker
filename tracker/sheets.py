@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import threading
+import time
 
 from . import config as cfg
 from . import db
@@ -140,7 +141,7 @@ def read_google(ranges=None):
     params = [("includeGridData", "true"), ("fields", FIELDS_MASK)]
     params += [("ranges", r) for r in ranges]
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{cfg.get('sheet_id')}"
-    resp = sess.get(url, params=params, timeout=180)
+    resp = api_call(sess.get, url, params=params, timeout=180)
     resp.raise_for_status()
     payload = resp.json()
     sheet = None
@@ -442,6 +443,41 @@ def _col_range(ws, col, row):
     return f"{ws}!{col}{row}"
 
 
+# Sheets API 配額是每使用者每分鐘 60 次請求；插一列要 4 次請求，數百列一次
+# 套用必然撞牆。主動節流到 55 次/分鐘，並對 429/5xx 指數退避重試，避免整批
+# 被標成 failed 還要人工重排。
+API_CALLS_PER_MIN = 55
+_api_times = []
+_api_lock = threading.Lock()
+
+
+def _throttle():
+    while True:
+        with _api_lock:
+            now = time.monotonic()
+            _api_times[:] = [t for t in _api_times if now - t < 60]
+            if len(_api_times) < API_CALLS_PER_MIN:
+                _api_times.append(now)
+                return
+            wait = 60 - (now - _api_times[0]) + 0.05
+        log.info("Sheets API 節流：等待 %.1fs", wait)
+        time.sleep(wait)
+
+
+def api_call(fn, *args, retries=5, **kwargs):
+    """Throttled Sheets API call with backoff on 429/5xx. `fn` is sess.get/post."""
+    delay = 2.0
+    for attempt in range(retries + 1):
+        _throttle()
+        resp = fn(*args, **kwargs)
+        if resp.status_code not in (429, 500, 502, 503, 504) or attempt == retries:
+            return resp
+        log.warning("Sheets API %s，%.0fs 後重試（第 %d 次）", resp.status_code, delay, attempt + 1)
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
+    return resp
+
+
 def _insert_value_batch(ws, new_row, code, p):
     """新插入列的 values:batchUpdate payload（純函式，供測試斷言）。
     0801 修正單：I 欄不再寫「new」——valid 連結 Note 必須空白，插列後 I 本來就空。"""
@@ -565,7 +601,7 @@ def apply_writes(write_ids, progress=None):
         done_cell_writes.append(w)
 
     if value_data:
-        resp = sess.post(f"{base}/values:batchUpdate", json={
+        resp = api_call(sess.post, f"{base}/values:batchUpdate", json={
             "valueInputOption": "USER_ENTERED", "data": value_data}, timeout=120)
         if resp.status_code != 200:
             for w in done_cell_writes:
@@ -597,16 +633,16 @@ def apply_writes(write_ids, progress=None):
                 "range": {"sheetId": sheet_num, "dimension": "ROWS",
                           "startIndex": last, "endIndex": last + 1},
                 "inheritFromBefore": True}}]
-            r1 = sess.post(f"{base}:batchUpdate", json={"requests": reqs}, timeout=60)
+            r1 = api_call(sess.post, f"{base}:batchUpdate", json={"requests": reqs}, timeout=60)
             r1.raise_for_status()
 
             value_batch = _insert_value_batch(ws, new_row, code, p)
-            r2 = sess.post(f"{base}/values:batchUpdate", json={
+            r2 = api_call(sess.post, f"{base}/values:batchUpdate", json={
                 "valueInputOption": "USER_ENTERED", "data": value_batch}, timeout=60)
             r2.raise_for_status()
 
             # F formula copied from the row above (SPEC: 向下複製)
-            r3 = sess.post(f"{base}:batchUpdate", json={"requests": [{"copyPaste": {
+            r3 = api_call(sess.post, f"{base}:batchUpdate", json={"requests": [{"copyPaste": {
                 "source": {"sheetId": sheet_num, "startRowIndex": last - 1, "endRowIndex": last,
                            "startColumnIndex": 5, "endColumnIndex": 6},
                 "destination": {"sheetId": sheet_num, "startRowIndex": last, "endRowIndex": last + 1,
@@ -615,7 +651,7 @@ def apply_writes(write_ids, progress=None):
             r3.raise_for_status()
 
             # read back verification
-            r4 = sess.get(f"{base}/values/{ws}!C{new_row}:H{new_row}",
+            r4 = api_call(sess.get, f"{base}/values/{ws}!C{new_row}:H{new_row}",
                           params={"valueRenderOption": "FORMULA"}, timeout=60)
             r4.raise_for_status()
             got = (r4.json().get("values") or [[]])[0]

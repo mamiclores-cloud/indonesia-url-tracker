@@ -4,6 +4,7 @@ We never issue signed API requests ourselves — we navigate real pages and read
 the XHR responses the page makes (api/v4/pdp/get_pc, api/v4/search/search_items).
 """
 import base64
+import datetime
 import json
 import logging
 import os
@@ -35,6 +36,33 @@ class LoginNeeded(Exception):
 
 class PageTimeout(Exception):
     pass
+
+
+# 安全網：一旦被出驗證碼／要求登入，就自動退回這組保守節奏一段時間，
+# 不必等人來調設定。到期自動恢復設定值（狀態列會顯示剩餘時間）。
+SAFE_PACING = {"min_delay_s": 3, "max_delay_s": 8, "long_pause_every": 25, "long_pause_s": 60}
+SAFE_MODE_HOURS = 6
+
+
+def enter_safe_pacing(reason=""):
+    from . import db
+    until = datetime.datetime.now() + datetime.timedelta(hours=SAFE_MODE_HOURS)
+    db.setting_set("pacing_safe_until", until.isoformat(timespec="seconds"))
+    log.warning("偵測到 %s，pacing 自動退回保守值至 %s", reason or "阻擋", until)
+
+
+def safe_pacing_until():
+    """Returns the ISO timestamp while safe mode is still in effect, else None."""
+    from . import db
+    v = db.setting_get("pacing_safe_until")
+    if not v:
+        return None
+    try:
+        if datetime.datetime.fromisoformat(v) > datetime.datetime.now():
+            return v
+    except ValueError:
+        pass
+    return None
 
 
 class ShopeeDriver:
@@ -84,7 +112,7 @@ class ShopeeDriver:
                 cap["event"].set()
 
     def _pace(self):
-        p = cfg.get("pacing")
+        p = SAFE_PACING if safe_pacing_until() else cfg.get("pacing")
         self._ops += 1
         if p.get("long_pause_every") and self._ops % p["long_pause_every"] == 0:
             log.info("pacing long pause %ss", p["long_pause_s"])
@@ -109,8 +137,10 @@ class ShopeeDriver:
         state = state or self.current_state()
         href = state.get("href", "")
         if "/verify/" in href or "captcha" in href.lower():
+            enter_safe_pacing("驗證碼")
             raise CaptchaDetected(href)
         if "/buyer/login" in href or "/account/login" in href:
+            enter_safe_pacing("登入要求")
             raise LoginNeeded(href)
         return state
 
@@ -136,6 +166,7 @@ class ShopeeDriver:
                 raise PageTimeout(f"{pattern} 未出現；頁面={state.get('href','?')}")
             if cap["status"] == 403:
                 self.bring_to_front()
+                enter_safe_pacing("API 403")
                 raise CaptchaDetected(f"API 403: {cap['url']}")
             try:
                 body = self.client.send(

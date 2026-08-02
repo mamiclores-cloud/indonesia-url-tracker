@@ -1,17 +1,41 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>寫入審核</h1>
+<h1>寫入審核 <small>全部待寫入 {{ all_pending }} 筆</small></h1>
 <section class="card">
   <div class="row">
-    <button onclick="applyAll()">套用全部待寫入</button>
+    <button onclick="applyAll()">套用全部待寫入（{{ all_pending }}）</button>
+    <button onclick="applyFiltered()">套用目前篩選（{{ n_pending }}）</button>
     <button onclick="applySelected()">套用勾選</button>
     <button class="warn" onclick="discardSelected()">捨棄勾選</button>
-    <span class="dim">dry-run 模式下，所有變更都先停在這裡，按「套用」才會寫進 Google Sheet</span>
   </div>
+  <div class="row dim">dry-run 模式下所有變更都先停在這裡，按「套用」才會寫進 Google Sheet。
+    寫入端已節流至每分鐘 55 次請求並自動重試，大批插列會花數十分鐘，可在任務頁看進度。</div>
 </section>
 
+<form class="toolbar" method="get" action="/review">
+  <input type="text" name="q" value="{{ flt.q }}" placeholder="搜尋 product code">
+  <select name="kind">
+    <option value="">全部類型</option>
+    <option value="update_price" {% if flt.kind=='update_price' %}selected{% endif %}>改價（{{ counts.get('update_price', 0) }}）</option>
+    <option value="set_note" {% if flt.kind=='set_note' %}selected{% endif %}>寫 Note（{{ counts.get('set_note', 0) }}）</option>
+    <option value="clear_note" {% if flt.kind=='clear_note' %}selected{% endif %}>清 Note（{{ counts.get('clear_note', 0) }}）</option>
+    <option value="insert_link_row" {% if flt.kind=='insert_link_row' %}selected{% endif %}>插新列（{{ counts.get('insert_link_row', 0) }}）</option>
+  </select>
+  <select name="state">
+    <option value="">全部狀態</option>
+    <option value="pending" {% if flt.state=='pending' %}selected{% endif %}>pending</option>
+    <option value="failed" {% if flt.state=='failed' %}selected{% endif %}>failed</option>
+  </select>
+  <button>篩選</button>
+</form>
+
 <section class="card">
-<h2>待寫入（{{ writes | selectattr('state', 'equalto', 'pending') | list | length }} pending / {{ writes | selectattr('state', 'equalto', 'failed') | list | length }} failed）</h2>
+<h2>待寫入（篩選結果 {{ total }} 筆，其中 {{ n_pending }} 筆可套用）</h2>
+<div id="selbar" class="row dim" hidden>
+  <span id="seltext"></span>
+  <a href="#" id="selall" onclick="selectAllFiltered(); return false;">選取符合目前篩選的全部 {{ n_pending }} 筆</a>
+  <a href="#" id="selclear" onclick="clearSelection(); return false;" hidden>清除選取</a>
+</div>
 <table>
 <thead><tr><th><input type="checkbox" onclick="toggleAll(this)"></th>
 <th>#</th><th>類型</th><th>商品</th><th>內容</th><th>狀態</th><th>錯誤</th></tr></thead>
@@ -35,6 +59,12 @@
 {% endfor %}
 </tbody>
 </table>
+<div class="pager">
+  {% set qs = 'q=' ~ flt.q ~ '&kind=' ~ flt.kind ~ '&state=' ~ flt.state %}
+  {% if page > 1 %}<a href="?{{ qs }}&page={{ page-1 }}">‹ 上一頁</a>{% endif %}
+  第 {{ page }} / {{ pages if pages else 1 }} 頁
+  {% if page < pages %}<a href="?{{ qs }}&page={{ page+1 }}">下一頁 ›</a>{% endif %}
+</div>
 </section>
 
 {% if cands %}
@@ -63,22 +93,68 @@
 {% endblock %}
 {% block scripts %}
 <script>
-function toggleAll(cb) { document.querySelectorAll('.sel').forEach(x => x.checked = cb.checked); }
+// 兩段式全選（Gmail 式）：表頭勾選＝本頁全選，再按一次連結才擴大到跨頁的
+// 全部篩選結果。跨頁模式下送出的是篩選條件而非 id 清單，不受分頁限制。
+const FILTER = {{ flt | tojson }};
+const N_FILTERED = {{ n_pending }};
+let allFiltered = false;
+
 function selectedIds() { return Array.from(document.querySelectorAll('.sel:checked')).map(x => +x.value); }
+
+function updateSelBar() {
+  const n = selectedIds().length;
+  const bar = document.getElementById('selbar');
+  bar.hidden = n === 0 && !allFiltered;
+  document.getElementById('seltext').textContent =
+    allFiltered ? `已選取符合篩選的全部 ${N_FILTERED} 筆　` : `已選取本頁 ${n} 筆　`;
+  document.getElementById('selall').hidden = allFiltered || n === 0 || N_FILTERED <= n;
+  document.getElementById('selclear').hidden = !allFiltered;
+}
+function toggleAll(cb) {
+  allFiltered = false;
+  document.querySelectorAll('.sel').forEach(x => x.checked = cb.checked);
+  updateSelBar();
+}
+function selectAllFiltered() {
+  allFiltered = true;
+  document.querySelectorAll('.sel').forEach(x => x.checked = true);
+  updateSelBar();
+}
+function clearSelection() {
+  allFiltered = false;
+  document.querySelectorAll('.sel').forEach(x => x.checked = false);
+  document.querySelector('thead input[type=checkbox]').checked = false;
+  updateSelBar();
+}
+document.addEventListener('change', e => {
+  if (e.target.classList && e.target.classList.contains('sel')) {
+    allFiltered = false;   // 動過個別勾選就退出跨頁模式，避免誤送
+    updateSelBar();
+  }
+});
 async function applyAll() {
+  if (!confirm('套用全部 {{ all_pending }} 筆待寫入？大批插列可能需要數十分鐘。')) return;
   const r = await api('/api/writes/apply', {});
+  if (r.ok) location.href = '/jobs/' + r.job_id; else alert(r.error || '失敗');
+}
+async function applyFiltered() {
+  if (!confirm('套用目前篩選的 {{ n_pending }} 筆？')) return;
+  const r = await api('/api/writes/apply', {filter: FILTER});
   if (r.ok) location.href = '/jobs/' + r.job_id; else alert(r.error || '失敗');
 }
 async function applySelected() {
   const ids = selectedIds();
-  if (!ids.length) return alert('請先勾選');
-  const r = await api('/api/writes/apply', {ids});
-  if (r.ok) location.href = '/jobs/' + r.job_id;
+  if (!allFiltered && !ids.length) return alert('請先勾選');
+  if (allFiltered && !confirm(`套用符合篩選的全部 ${N_FILTERED} 筆？`)) return;
+  const r = await api('/api/writes/apply', allFiltered ? {filter: FILTER} : {ids});
+  if (r.ok) location.href = '/jobs/' + r.job_id; else alert(r.error || '失敗');
 }
 async function discardSelected() {
   const ids = selectedIds();
-  if (!ids.length) return alert('請先勾選');
-  await api('/api/writes/discard', {ids});
+  if (!allFiltered && !ids.length) return alert('請先勾選');
+  const n = allFiltered ? N_FILTERED : ids.length;
+  if (!confirm(`捨棄 ${n} 筆待寫入？捨棄後不會寫進 Sheet，下次檢查會重新產生。`)) return;
+  await api('/api/writes/discard', allFiltered ? {filter: FILTER} : {ids});
   location.reload();
 }
 async function cand(id, action) {
