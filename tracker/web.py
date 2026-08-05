@@ -275,24 +275,59 @@ def settings():
 
 # -------------------------------------------------------------------- api --
 
-@bp.get("/api/status")
-def api_status():
+ACTIVE_JOB_STATES = "('pending','running','paused_captcha','paused_login','paused_user')"
+
+
+def _status_payload():
+    """狀態列的真相來源。
+
+    0803：這裡原本取 `ORDER BY id DESC LIMIT 1`，也就是「id 最大的活躍任務」。
+    使用者在 full_scan #270 跑到一半時建立 apply #273，狀態列就一路顯示
+    「任務#273 pending 0/1」，真正在跑的 #270 完全隱形——看起來像卡死，其實
+    是排隊。改成回報「實際在執行的那一個」＋佇列長度＋被擋的那一個。
+    """
     from . import shopee, sheets
-    cur = db.q1("SELECT * FROM jobs WHERE state IN ('pending','running','paused_captcha','paused_login','paused_user') "
-                "ORDER BY id DESC LIMIT 1")
-    n_pending_writes = db.q1("SELECT COUNT(*) AS n FROM pending_writes WHERE state='pending'")["n"]
-    n_proposed = db.q1("SELECT COUNT(*) AS n FROM candidates WHERE state='proposed'")["n"]
-    return jsonify({
+    running = db.q1(f"SELECT * FROM jobs WHERE state='running' ORDER BY id LIMIT 1")
+    blocked_job = db.q1("SELECT * FROM jobs WHERE state IN ('paused_captcha','paused_login') "
+                        "ORDER BY id LIMIT 1")
+    paused_user = db.q1("SELECT * FROM jobs WHERE state='paused_user' ORDER BY id LIMIT 1")
+    pending = db.q1("SELECT * FROM jobs WHERE state='pending' ORDER BY id LIMIT 1")
+    n_queued = db.q1(f"SELECT COUNT(*) AS n FROM jobs WHERE state IN {ACTIVE_JOB_STATES}")["n"]
+    cur = blocked_job or running or paused_user or pending
+    block = shopee.block_status()
+    return {
         "chrome": shopee.driver_status(),
         "google": sheets.auth_status(),
         "job": dict(cur) if cur else None,
+        "running_job": dict(running) if running else None,
+        "queued_jobs": n_queued,
+        "block": {"blocked": block["blocked"], "since": block["since"],
+                  "reason": block["reason"], "probe_fails": block["probe_fails"],
+                  "count_today": block["count_today"],
+                  "warn": block["count_today"] >= shopee.BLOCK_WARN_COUNT},
         "dry_run": bool(cfg.get("dry_run")),
         "last_sync": db.setting_get("last_sync_at"),
-        "pending_writes": n_pending_writes,
-        "proposed_candidates": n_proposed,
-        "pacing_safe_until": shopee.safe_pacing_until(),
+        "pending_writes": db.q1("SELECT COUNT(*) AS n FROM pending_writes WHERE state='pending'")["n"],
+        "proposed_candidates": db.q1("SELECT COUNT(*) AS n FROM candidates WHERE state='proposed'")["n"],
         "sync": dict(_sync_state),
-    })
+    }
+
+
+@bp.get("/api/status")
+def api_status():
+    """前端每 3 秒打一次。任何子系統故障都不得讓它 500——app.js 收到非 JSON
+    就整個 pollStatus 放棄，狀態列、驗證碼橫幅、審核徽章會一起失明。"""
+    try:
+        return jsonify(_status_payload())
+    except Exception as e:
+        log.exception("api_status failed")
+        return jsonify({"chrome": {"chrome_alive": False, "work_tab": False},
+                        "google": {"ok": False, "reason": str(e)},
+                        "job": None, "running_job": None, "queued_jobs": 0,
+                        "block": {"blocked": False, "count_today": 0, "warn": False},
+                        "dry_run": bool(cfg.get("dry_run")), "pending_writes": 0,
+                        "proposed_candidates": 0, "sync": dict(_sync_state),
+                        "status_error": f"{type(e).__name__}: {e}"})
 
 
 @bp.post("/api/sync/pull")
@@ -340,6 +375,9 @@ def api_create_job():
 
 @bp.post("/api/jobs/<int:job_id>/<action>")
 def api_job_action(job_id, action):
+    if action == "retry_failed":
+        n = jobs_mod.retry_failed_items(job_id)
+        return jsonify({"ok": True, "retried": n, "state": jobs_mod.job_state(job_id)})
     fn = {"pause": jobs_mod.request_pause, "resume": jobs_mod.request_resume,
           "stop": jobs_mod.request_stop}.get(action)
     if fn is None:
@@ -455,16 +493,18 @@ def api_config():
                "auto_accept_candidates", "record_keyword_to_sheet",
                "worksheet_name", "sheet_id", "chrome_path",
                "idr_per_twd_divisor", "target_links_per_product", "pacing",
-               "find_time_budget_s", "search_locations_param"}
+               "find_time_budget_s", "search_locations_param",
+               "work_block_hours", "work_break_minutes"}
     updates = {k: v for k, v in data.items() if k in allowed}
     if "high_cost_pct" in updates:
         updates["high_cost_pct"] = float(updates["high_cost_pct"])
     for k in ("min_sold", "target_links_per_product", "idr_per_twd_divisor",
-              "find_time_budget_s"):
+              "find_time_budget_s", "work_break_minutes"):
         if k in updates:
             updates[k] = int(updates[k])
-    if "image_sim_threshold" in updates:
-        updates["image_sim_threshold"] = float(updates["image_sim_threshold"])
+    for k in ("image_sim_threshold", "work_block_hours"):
+        if k in updates:
+            updates[k] = float(updates[k])
     cfg.set_values(updates)
     return jsonify({"ok": True, "config": cfg.all_values()})
 

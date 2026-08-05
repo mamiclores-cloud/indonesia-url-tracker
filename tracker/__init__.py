@@ -1,7 +1,6 @@
 import logging
 import logging.handlers
 import os
-import threading
 
 from flask import Flask
 
@@ -45,9 +44,9 @@ def create_app(start_worker=True):
     app.register_blueprint(bp)
 
     if start_worker:
-        from . import jobs
+        from . import jobs, sheets
         jobs.recover_orphan_jobs()
-        t = threading.Thread(target=jobs.worker_loop, name="job-worker", daemon=True)
-        t.start()
+        jobs.start_workers()
+        sheets.start_access_refresher()
 
     return app

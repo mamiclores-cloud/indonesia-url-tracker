@@ -42,6 +42,21 @@ _auth_flow_state = {"running": False, "error": None}
 
 
 def get_creds():
+    """服務帳戶優先，沒有才退回使用者 OAuth。
+
+    OAuth 同意畫面停在「測試中」(Testing) 發布狀態時，Google 發出的 refresh
+    token **固定 7 天後失效**——這正是 0803 apply #273 失敗的直接原因（授權於
+    07-27 19:35 完成、08-03 19:38 最後一次成功更新、當晚 23:34 即 invalid_grant）。
+    對一個無人值守、單趟跑幾十小時的批次工具來說，「每 7 天要有人去點瀏覽器
+    重新授權」是結構性的錯誤設計，所以改用服務帳戶：不過期、不需要瀏覽器。
+
+    使用前提：把試算表分享給 service_account.json 裡的 client_email（編輯者）。
+    """
+    if os.path.exists(cfg.SERVICE_ACCOUNT_PATH):
+        from google.oauth2 import service_account
+        return service_account.Credentials.from_service_account_file(
+            cfg.SERVICE_ACCOUNT_PATH, scopes=SCOPES)
+
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
@@ -50,7 +65,13 @@ def get_creds():
     creds = Credentials.from_authorized_user_file(cfg.GOOGLE_TOKEN_PATH, SCOPES)
     if not creds.valid:
         if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                # RefreshError（token 過期／被撤銷）不是「程式壞了」，是「要重新
+                # 授權」。讓它往外拋會把 /api/status 打成 500，連帶讓整個狀態列
+                # 與驗證碼橫幅失明（0803 就是這樣，log 被 traceback 灌到 8MB）。
+                raise GoogleAuthNeeded(f"Google 授權已失效，請重新授權：{e}")
             with open(cfg.GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
                 f.write(creds.to_json())
         else:
@@ -58,16 +79,89 @@ def get_creds():
     return creds
 
 
+def auth_mode():
+    return "service_account" if os.path.exists(cfg.SERVICE_ACCOUNT_PATH) else "oauth"
+
+
+def service_account_email():
+    try:
+        with open(cfg.SERVICE_ACCOUNT_PATH, "r", encoding="utf-8") as f:
+            return json.load(f).get("client_email", "")
+    except (OSError, ValueError):
+        return ""
+
+
+_access_cache = {"at": 0.0, "ok": None, "error": None}
+ACCESS_TTL_S = 300
+
+
+def check_access(force=False):
+    """憑證有效 ≠ 拿得到那張表。
+
+    服務帳戶是一個獨立的 Google 身分，試算表必須先分享給它，否則所有呼叫都是
+    403。這一步是一次輕量的 metadata 呼叫，讓狀態說的是「真的能寫嗎」而不是
+    「憑證檔存在嗎」。
+
+    **會發網路請求**，所以只在背景刷新與 apply 開跑前呼叫；每 3 秒一次的
+    /api/status 走 access_status() 讀快取，絕不在同步路徑做 I/O。
+
+    回傳 (ok, error_message)。永不外拋。
+    """
+    if not force and _access_cache["ok"] is not None \
+            and time.time() - _access_cache["at"] < ACCESS_TTL_S:
+        return _access_cache["ok"], _access_cache["error"]
+    ok, err = False, None
+    try:
+        url = (f"https://sheets.googleapis.com/v4/spreadsheets/{cfg.get('sheet_id')}"
+               "?fields=properties.title")
+        r = api_call(_session().get, url, retries=1, timeout=10)
+        ok = r.status_code == 200
+        if not ok:
+            err = f"HTTP {r.status_code}: {r.text[:160]}"
+            if r.status_code in (403, 404) and auth_mode() == "service_account":
+                err = f"請把試算表分享給服務帳戶 {service_account_email()}（編輯者權限）"
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    _access_cache.update(at=time.time(), ok=ok, error=err)
+    return ok, err
+
+
+def access_status():
+    """純讀快取，不做任何 I/O。尚未檢查過時回 (None, None)。"""
+    return _access_cache["ok"], _access_cache["error"]
+
+
+def start_access_refresher():
+    """背景定期確認「還拿得到那張表嗎」。權限被撤、試算表被改名或刪除，
+    都該在狀態列上看得到，而不是等到 apply 寫到一半才發現。"""
+    def run():
+        while True:
+            try:
+                check_access(force=True)
+            except Exception:
+                log.exception("access refresh failed")
+            time.sleep(ACCESS_TTL_S)
+
+    threading.Thread(target=run, name="sheets-access", daemon=True).start()
+
+
 def auth_status():
+    """永不外拋——任一子系統故障都不該讓 /api/status 整個掛掉。"""
+    base = {"mode": auth_mode(), "flow_running": _auth_flow_state["running"],
+            "error": _auth_flow_state["error"]}
     try:
         get_creds()
-        return {"ok": True, "flow_running": _auth_flow_state["running"],
-                "error": _auth_flow_state["error"]}
+        ok, err = access_status()          # 快取，不發網路請求
+        if ok is False:
+            return dict(base, ok=False, reason=err)
+        return dict(base, ok=True, access_checked=ok is True)
     except GoogleAuthNeeded as e:
-        return {"ok": False, "reason": str(e),
-                "has_client_secret": os.path.exists(cfg.CLIENT_SECRET_PATH),
-                "flow_running": _auth_flow_state["running"],
-                "error": _auth_flow_state["error"]}
+        return dict(base, ok=False, reason=str(e),
+                    has_client_secret=os.path.exists(cfg.CLIENT_SECRET_PATH))
+    except Exception as e:
+        log.warning("auth_status 失敗：%s", e)
+        return dict(base, ok=False, reason=f"{type(e).__name__}: {e}",
+                    has_client_secret=os.path.exists(cfg.CLIENT_SECRET_PATH))
 
 
 def start_auth_flow():

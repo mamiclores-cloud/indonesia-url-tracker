@@ -17,6 +17,9 @@
       <button onclick="jobAction('resume')">續跑</button>
       <button class="warn" onclick="jobAction('stop')">停止</button>
     {% endif %}
+    {% if by_state.get('failed') %}
+      <button onclick="jobAction('retry_failed')">重跑失敗項（{{ by_state['failed'] }}）</button>
+    {% endif %}
     <a href="/review"><button type="button">前往審核寫入</button></a>
   </div>
 </section>

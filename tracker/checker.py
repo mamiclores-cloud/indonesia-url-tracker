@@ -200,6 +200,11 @@ def run_fetch_link(job, item):
               "reason": parsed.get("reason"), "unlisted": parsed.get("unlisted", False),
               "title": parsed.get("title"), "shop_name": parsed.get("shop_name"),
               "images": (parsed.get("images") or [])[:1]}
+    if parsed.get("unknown_error"):
+        # 沒看過的 API 錯誤碼，而且系統已確認沒被擋 → 這條連結本身有問題，
+        # 但我們不知道是什麼問題。標 error 供人複核，絕不寫任何東西到表上。
+        result["outcome"] = "unknown_response"
+        return result
     if not parsed.get("exists"):
         result["outcome"] = "invalid"
         return result
@@ -262,11 +267,20 @@ def run_classify_product(job, item):
         if got is None:
             continue
         st, res = got
+        # no_write：本次判定不可信到足以動客戶的表，只在本地留痕給人看
+        no_write = False
         if st == "failed":
+            # 抓取例外 → error → Note「link error」（0801 修正單：只要是 invalid
+            # 就一定有 Note）。註：這代表一次暫時性故障（CDP 斷線、逾時）也會把
+            # 連結標成失效並寫回表，可用任務頁的「重跑失敗項」修正。
             status, detail = "error", res.get("error", "fetch failed")
         else:
             outcome = res.get("outcome")
-            if outcome == "invalid":
+            if outcome == "unknown_response":
+                status = "error"
+                detail = f"{res.get('reason') or '未知回應'}（未下判定，待人工複核）"
+                no_write = True
+            elif outcome == "invalid":
                 status, detail = "invalid", res.get("reason") or res.get("detail") or ""
             elif outcome == "variant_error":
                 status, detail = "variant_error", res.get("detail", "variant not matched")
@@ -298,6 +312,8 @@ def run_classify_product(job, item):
         summary["links"][lk["id"]] = {"status": status, "price": price}
 
         # ---- pending writes ------------------------------------------------
+        if no_write:
+            continue
         if price and price != lk["price_idr"] and status in ("valid", "sold_out", "unlisted", "high_cost"):
             _queue_write(job["id"], "update_price", lk, {"price_idr": price, "raw_url": lk["raw_url"]})
         target_note = NOTE_FOR_STATUS.get(status)

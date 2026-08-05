@@ -527,18 +527,73 @@ def main():
         cfg._config["find_time_budget_s"] = 240
     print("find time budget OK: 超時即收工並標註，任務不中斷")
 
-    # ---- pacing 安全網（0802）--------------------------------------------
-    assert shopee.safe_pacing_until() is None
-    shopee.enter_safe_pacing("測試")
-    assert shopee.safe_pacing_until(), "偵測到阻擋後應進入保守節奏"
-    drv = shopee.ShopeeDriver()
+    # ---- 0805：反機器人攔截不得變成業務判定 --------------------------------
+    # 素材原封不動取自 data/raw/249.json.gz（真的被擋時 Shopee 回的東西）。
+    # 舊行為把它當「商品不存在」→ 好連結被標失效 → 排隊寫「link error」進客戶的表。
+    import time as _time
     import unittest.mock
-    with unittest.mock.patch("tracker.shopee.time.sleep") as slept:
-        drv._pace()
-    assert slept.call_args[0][0] >= shopee.SAFE_PACING["min_delay_s"], slept.call_args
-    db.x("DELETE FROM settings WHERE key='pacing_safe_until'")
-    assert shopee.safe_pacing_until() is None
-    print("safe pacing OK: 阻擋後自動退回保守值、到期自動恢復")
+    drv = shopee.ShopeeDriver()
+    BLOCK_RAW = {"5": False, "2": False, "0": 2, "3": 90309999, "error": 90309999,
+                 "1": "866f763d6a5-d6f2-4fb7-948a-2552832f7972", "9": True}
+    NOTFOUND_RAW = {"bff_meta": None, "error": 266900002, "error_msg": None, "data": None}
+    UNKNOWN_RAW = {"bff_meta": None, "error": 12345678, "error_msg": None, "data": None}
+
+    shopee.clear_blocked()
+    try:
+        drv._parse_pdp_guarded(BLOCK_RAW)
+        assert False, "攔截回應必須丟 CaptchaDetected，不可回 exists=False"
+    except shopee.CaptchaDetected:
+        pass
+    assert shopee.is_blocked(), "攔截應設起全域封鎖旗標"
+    assert shopee.block_status()["count_today"] >= 1
+    shopee.clear_blocked()
+
+    parsed = drv._parse_pdp_guarded(NOTFOUND_RAW)
+    assert parsed["exists"] is False and parsed["reason"] == "api-error:266900002", parsed
+    assert not parsed.get("unknown_error") and not shopee.is_blocked(), \
+        "266900002 是真的商品不存在，不可誤判成封鎖"
+
+    with unittest.mock.patch.object(drv, "probe", return_value=True):
+        parsed = drv._parse_pdp_guarded(UNKNOWN_RAW)
+    assert parsed.get("unknown_error") and not shopee.is_blocked(), parsed
+    with unittest.mock.patch.object(drv, "probe", return_value=False):
+        try:
+            drv._parse_pdp_guarded(UNKNOWN_RAW)
+            assert False, "未知碼且確認被擋時應丟 CaptchaDetected"
+        except shopee.CaptchaDetected:
+            pass
+    assert shopee.is_blocked()
+    shopee.clear_blocked()
+    print("block detection OK: 攔截碼/未知碼不下判定，真實 not-found 不誤判")
+
+    # ---- 連續 0 筆搜尋 → 主動確認才判定（不是純計數）----------------------
+    drv2 = shopee.ShopeeDriver()
+    with unittest.mock.patch.object(drv2, "probe", return_value=True) as probed:
+        for _ in range(shopee.ZERO_RESULT_TRIGGER):
+            drv2._note_search_results(0)
+    assert probed.call_count == 1 and drv2._zero_streak == 0, \
+        "系統正常時應歸零繼續跑（關鍵字爛不是被擋）"
+    drv2._note_search_results(5)
+    assert drv2._zero_streak == 0
+    shopee.clear_blocked()
+    with unittest.mock.patch.object(drv2, "probe", return_value=False):
+        try:
+            for _ in range(shopee.ZERO_RESULT_TRIGGER):
+                drv2._note_search_results(0)
+            assert False, "連續 0 筆且確認被擋時應丟 CaptchaDetected"
+        except shopee.CaptchaDetected:
+            pass
+    assert shopee.is_blocked()
+    shopee.clear_blocked()
+    print("soft-block OK: 計數器只當觸發器，判定交給主動確認")
+
+    # ---- 工作區塊休息（連續時長才是 0803 沒被驗證過的那個變因）------------
+    drv3 = shopee.ShopeeDriver()
+    drv3._work_since = _time.monotonic() - 5 * 3600
+    with unittest.mock.patch("tracker.shopee._sleep") as slept:
+        drv3._work_break()
+    assert slept.call_args[0][0] == cfg.get("work_break_minutes") * 60, slept.call_args
+    print("work break OK: 連續工作滿 N 小時強制休息")
 
     # ---- Sheets API 節流與重試（0802）------------------------------------
     calls = []
@@ -572,6 +627,77 @@ def main():
     n_set_note = db.q1("SELECT COUNT(*) n FROM pending_writes WHERE kind='set_note' AND state='pending'")["n"]
     assert total == seen == n_set_note, (total, seen, n_set_note)
     print(f"review API OK: filter 空集合不誤觸全部；分頁涵蓋 {seen} 筆無重複遺漏")
+
+    # ---- 0805：看不懂的回應不可寫進客戶的表 --------------------------------
+    reset()
+    rows = links_by_row()
+    setup_pdp(fake, rows)
+    fake.pdp[rows[25]["itemid"]] = {"exists": False, "unknown_error": True,
+                                    "reason": "api-error:12345678", "unlisted": False,
+                                    "models": [], "images": []}
+    job_id = jobs.create_job("check", {"product_codes": [CODE]})
+    run_job_to_completion(job_id)
+    lk = dict(db.q1("SELECT * FROM links WHERE id=?", (rows[25]["id"],)))
+    assert lk["status"] == "error" and "複核" in (lk["status_detail"] or ""), lk
+    n_bad = db.q1("SELECT COUNT(*) n FROM pending_writes WHERE job_id=? AND kind='set_note' "
+                  "AND payload_json LIKE '%link error%'", (job_id,))["n"]
+    assert n_bad == 0, "未下判定的連結不可排任何 note 寫入"
+    print("unknown response OK: 標 error 供人複核，不動客戶的表")
+
+    # ---- 0805：apply 不該排在幾十小時的掃描後面（#273 卡 6h26m 的成因）-----
+    def _pick(kinds):
+        ph = ",".join("?" * len(kinds))
+        r = db.q1(f"SELECT id FROM jobs WHERE state IN ('pending','running') "
+                  f"AND kind IN ({ph}) ORDER BY id LIMIT 1", kinds)
+        return r["id"] if r else None
+
+    db.x("UPDATE jobs SET state='stopped' WHERE state IN ('pending','running')")
+    long_id = db.x("INSERT INTO jobs(kind,state,params_json,progress_total,created_at,updated_at) "
+                   "VALUES('full_scan','running','{}',5843,?,?)", (db.now(), db.now())).lastrowid
+    apply_id = db.x("INSERT INTO jobs(kind,state,params_json,progress_total,created_at,updated_at) "
+                    "VALUES('apply','pending','{}',1,?,?)", (db.now(), db.now())).lastrowid
+    db.x("INSERT INTO job_items(job_id,kind,target,state,updated_at) "
+         "VALUES(?,'apply_writes','batch','pending',?)", (apply_id, db.now()))
+    assert _pick(jobs.SHOPEE_KINDS) == long_id, "shopee worker 仍嚴格序列，接著跑 full_scan"
+    assert _pick(jobs.SHEET_KINDS) == apply_id, "apply 必須立刻被 sheet worker 取走，不必等 full_scan"
+
+    # 但被擋時 apply 也要停手——否則封鎖期間的判定會經由它寫進客戶的表
+    shopee.mark_blocked("測試封鎖")
+    assert run_job_to_completion(apply_id) == "running", "被擋時應讓出 worker 而非跑完"
+    assert db.q1("SELECT state FROM job_items WHERE job_id=?", (apply_id,))["state"] == "pending"
+    shopee.clear_blocked()
+    print("scheduling OK: apply 不排隊等掃描，但被擋時一起停手")
+
+    # ---- 0805：狀態列要顯示「正在跑的」而不是「id 最大的」------------------
+    js = cl.get("/api/status").get_json()
+    assert js["running_job"] and js["running_job"]["id"] == long_id, js["running_job"]
+    assert js["queued_jobs"] >= 2, js["queued_jobs"]
+    # Google token 失效不得讓 /api/status 500（0803 每 3 秒噴一次、log 被灌到 8MB）
+    with unittest.mock.patch("tracker.sheets.get_creds",
+                             side_effect=RuntimeError("invalid_grant: Token has been expired or revoked")):
+        rv = cl.get("/api/status")
+    assert rv.status_code == 200 and rv.get_json()["google"]["ok"] is False, rv.status_code
+    print("status API OK: 回報執行中任務＋佇列；授權失效不再 500")
+
+    # ---- 0805：三級收尾狀態 + 重跑失敗項 ----------------------------------
+    jobs._finish_job(long_id)
+    assert db.q1("SELECT message FROM jobs WHERE id=?", (long_id,))["message"] == "完成"
+    db.x("INSERT INTO job_items(job_id,kind,target,state,result_json,updated_at) "
+         "VALUES(?,'fetch_link','1','done','{}',?)", (long_id, db.now()))
+    db.x("INSERT INTO job_items(job_id,kind,target,state,result_json,updated_at) "
+         "VALUES(?,'fetch_link','2','failed',?,?)", (long_id, db.jdump({"error": "boom"}), db.now()))
+    jobs._finish_job(long_id)
+    row = dict(db.q1("SELECT state,message FROM jobs WHERE id=?", (long_id,)))
+    assert row["state"] == "done" and "1 項失敗" in row["message"], row
+    db.x("UPDATE job_items SET state='failed' WHERE job_id=?", (long_id,))
+    jobs._finish_job(long_id)
+    row = dict(db.q1("SELECT state,message FROM jobs WHERE id=?", (long_id,)))
+    assert row["state"] == "failed" and "boom" in row["message"], row
+    assert jobs.retry_failed_items(long_id) == 2
+    assert db.q1("SELECT COUNT(*) n FROM job_items WHERE job_id=? AND state='pending'",
+                 (long_id,))["n"] == 2
+    db.x("UPDATE jobs SET state='stopped' WHERE id IN (?,?)", (long_id, apply_id))
+    print("job finish OK: 完成／完成但 N 項失敗／全失敗三級，失敗項可重跑")
 
     # ---- 分頁夾頁：超出範圍停在最後一頁，不出現空表（0802）----------------
     for url in ("/products?page=999", "/review?page=999", "/jobs?page=999"):
