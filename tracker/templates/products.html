@@ -13,9 +13,8 @@
   </select>
   <button>篩選</button>
   <span class="spacer"></span>
-  <button type="button" onclick="checkSelected()">檢查勾選商品</button>
-  <button type="button" onclick="findSelected()">為勾選商品找連結</button>
-  <button type="button" class="warn" onclick="fullScan()">全表掃描</button>
+  <button type="button" onclick="checkSelected()">檢查並補找（勾選商品）</button>
+  <button type="button" class="warn" onclick="fullScan()">全表檢查並補找</button>
 </form>
 <table>
 <thead><tr>
@@ -38,11 +37,7 @@
     {% if r.n_unchecked %}<span class="tag">{{ r.n_unchecked }} 未查</span>{% endif %}
   </td>
   <td class="num">{{ '{:,}'.format(r.min_price) if r.min_price else '' }}</td>
-  {% set eff = r.baseline_override_idr or r.min_valid_price %}
-  <td class="num">
-    {{ '{:,}'.format(eff) if eff else '—' }}
-    {% if r.baseline_override_idr %}<span class="tag" title="手動設定">手動</span>{% endif %}
-  </td>
+  <td class="num">{{ '{:,}'.format(r.baseline_idr) if r.baseline_idr else '—' }}</td>
   <td class="dim">{{ (r.last_checked or '')[:16] }}</td>
 </tr>
 {% endfor %}
@@ -65,13 +60,7 @@ function toggleAll(cb) {
 async function checkSelected() {
   const codes = selected();
   if (!codes.length) return alert('請先勾選商品');
-  const r = await api('/api/jobs', {kind: 'check', product_codes: codes});
-  if (r.ok) location.href = '/jobs/' + r.job_id;
-}
-async function findSelected() {
-  const codes = selected();
-  if (!codes.length) return alert('請先勾選商品');
-  const r = await api('/api/jobs', {kind: 'find', product_codes: codes});
+  const r = await api('/api/jobs', {kind: 'check', product_codes: codes, include_find: true});
   if (r.ok) location.href = '/jobs/' + r.job_id;
 }
 async function fullScan() {

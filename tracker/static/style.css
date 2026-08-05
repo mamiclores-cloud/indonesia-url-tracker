@@ -28,6 +28,7 @@ tr:hover td { background: #f8fafc; }
 .st-valid, .st-done, .st-written { background: #dcfce7; color: #15803d; }
 .st-running, .st-pending { background: #dbeafe; color: #1d4ed8; }
 .st-sold_out, .st-unlisted { background: #ede9fe; color: #6d28d9; }
+.st-unchecked { background: #e5e7eb; color: #4b5563; }
 button { padding: 5px 12px; border: 1px solid #d1d5db; border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; }
 button:hover { background: #f3f4f6; }
 button.warn { border-color: #fca5a5; color: #b91c1c; }

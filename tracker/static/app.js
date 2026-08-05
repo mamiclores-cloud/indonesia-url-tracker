@@ -34,7 +34,13 @@ async function pollStatus() {
     parts.push(s.chrome.chrome_alive ? 'Chrome ✅' : 'Chrome ⚫');
     parts.push(s.google.ok ? 'Google ✅' : 'Google ⚫');
     parts.push(s.dry_run ? 'dry-run' : '⚠️ 直接寫入');
-    if (s.job) parts.push(`任務#${s.job.id} ${s.job.state} ${s.job.progress_done}/${s.job.progress_total}`);
+    if (s.block && s.block.blocked) parts.push('🚫 已被擋，停止中');
+    if (s.block && s.block.count_today) parts.push(`今日被擋 ${s.block.count_today} 次`);
+    // 顯示「實際在執行的那一個」，不是 id 最大的那一個——後者會讓正在跑的
+    // 長任務隱形，看起來像整個系統卡住。
+    const j = s.running_job || s.job;
+    if (j) parts.push(`任務#${j.id} ${j.state} ${j.progress_done}/${j.progress_total}`);
+    if (s.queued_jobs > 1) parts.push(`佇列 ${s.queued_jobs - 1}`);
     bar.textContent = parts.join('　');
   }
   const badge = document.getElementById('nav-review-badge');
@@ -45,11 +51,21 @@ async function pollStatus() {
   }
   const banner = document.getElementById('banner');
   if (banner) {
+    const warn = s.block && s.block.warn
+      ? `<br>⚠️ 今日已被擋 ${s.block.count_today} 次，建議停止排程並檢查帳號狀態。` : '';
     if (s.job && (s.job.state === 'paused_captcha' || s.job.state === 'paused_login')) {
       banner.hidden = false;
       banner.innerHTML = `⚠️ ${s.job.message}　` +
-        `<button onclick="api('/api/jobs/${s.job.id}/resume',{}).then(()=>location.reload())">已處理，續跑</button>`;
+        `<button onclick="api('/api/jobs/${s.job.id}/resume',{}).then(()=>location.reload())">已處理，續跑</button>` +
+        (s.block && s.block.probe_fails ? `　<span class="dim">自動探測已失敗 ${s.block.probe_fails} 次</span>` : '') +
+        warn;
       document.title = '⚠️ 需要人工處理';
+    } else if (s.status_error) {
+      banner.hidden = false;
+      banner.innerHTML = `⚠️ 狀態查詢異常：${s.status_error}`;
+    } else if (warn) {
+      banner.hidden = false;
+      banner.innerHTML = warn;
     } else {
       banner.hidden = true;
     }

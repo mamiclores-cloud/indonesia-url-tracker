@@ -1,115 +1,96 @@
 {% extends "base.html" %}
 {% block title %}{{ p.code }}{% endblock %}
+
+{% macro link_head() %}
+<thead><tr><th>列</th><th>標題 / 規格</th><th>賣場</th><th>地區</th><th>銷量</th>
+<th>前次價格</th><th>最新價格</th><th>狀態</th><th>Note</th><th>搜尋關鍵字</th><th>最後檢查</th></tr></thead>
+{% endmacro %}
+
+{% macro link_row(l) %}
+<tr>
+  <td class="dim">{{ l.sheet_row_hint or '' }}</td>
+  <td>
+    <a href="{{ l.canonical_url or l.raw_url }}" target="_blank">{{ (l.page_name or l.raw_url)[:70] }}</a>
+    {% if l.virtual %}<span class="tag st-pending">待寫入表</span>{% endif %}
+    <div class="dim">{{ l.variant_text or '' }}</div>
+  </td>
+  <td>{{ l.supplier or '' }}</td>
+  <td>{{ l.shop_location or '' }}</td>
+  <td class="num">{{ '{:,}'.format(l.sold) if l.sold else '' }}</td>
+  {% set prevp = l.prev_price_idr or l.price_idr %}
+  {% set lastp = l.last_price_idr or l.price_idr %}
+  <td class="num">{{ '{:,}'.format(prevp) if prevp else '' }}</td>
+  <td class="num">{{ '{:,}'.format(lastp) if lastp else '' }}</td>
+  <td><span class="tag st-{{ l.ui_status }}">{{ l.ui_status }}</span>
+      <div class="dim">{{ l.status_detail or '' }}</div></td>
+  <td>{{ l.ui_note or '' }}{% if l.human_note %}<div class="dim">{{ l.human_note }}</div>{% endif %}</td>
+  <td class="dim">{{ l.search_keyword or '' }}</td>
+  <td class="dim">{{ (l.last_checked_at or '')[:16] }}</td>
+</tr>
+{% endmacro %}
+
 {% block content %}
 <h1>{{ p.code }} <small>{{ p.item_name or '' }}</small></h1>
 
 <section class="card">
-  {% set eff = p.baseline_override_idr or auto_baseline %}
   <h2>基準成本</h2>
   <div class="row">
-    <label>目前基準價：<b>{{ '{:,}'.format(eff) if eff else '無有效連結' }}</b> IDR
-      {% if p.baseline_override_idr %}<span class="tag">手動設定</span>
-      {% elif auto_baseline %}<span class="tag">自動（有效連結最低價 {{ '{:,}'.format(auto_baseline) }}）</span>
-      {% endif %}
-    </label>
+    <label>目前基準價：<b>{{ '{:,}'.format(p.baseline_idr) if p.baseline_idr else '未定植' }}</b> IDR</label>
   </div>
   <div class="row">
     <label>基準價 (IDR)：
-      <input id="baseline" type="number" value="{{ eff or '' }}" placeholder="留空 = 自動計算">
+      <input id="baseline" type="number" value="{{ p.baseline_idr or '' }}">
     </label>
     <label>high cost 門檻 X%：
       <input id="pct" type="number" step="0.5" value="{{ p.high_cost_pct if p.high_cost_pct is not none else '' }}"
              placeholder="全域 {{ global_pct }}%">
     </label>
-    <button onclick="saveBaseline()">儲存為手動基準</button>
-    {% if p.baseline_override_idr %}<button class="warn" onclick="resetBaseline()">改回自動</button>{% endif %}
+    <button onclick="saveBaseline()">儲存基準價</button>
   </div>
-  <div class="row dim">手動基準會固定不變；「改回自動」則永遠取有效連結中的最低價當基準。high cost = 最新價 &gt; 基準價 ×(1 + X%)。</div>
+  <div class="row dim">基準價於商品首次進入系統時取「查詢前表上最低價」定植一次；程式不會變動，僅能在此人工修改。high cost = 最新價 &gt; 基準價 ×(1 + X%)。</div>
+  {% if p.search_keyword %}
+  <div class="row dim">最近一次搜尋關鍵字：<b>{{ p.search_keyword }}</b>{% if p.search_keyword_at %}（{{ p.search_keyword_at[:16] }}）{% endif %}</div>
+  {% endif %}
   <div class="row">
-    <button onclick="runJob('check')">檢查此商品連結</button>
-    <button onclick="runJob('find')">為此商品找新連結</button>
+    <button onclick="runCheckFind()">檢查並補找連結</button>
   </div>
+  <div class="row dim">一鍵依序執行：檢查所有連結 → 區分 valid / invalid → 缺幾補幾找新連結 → 依價格重排正式連結與備選區。</div>
 </section>
 
 <section class="card">
-<h2>連結（{{ links | selectattr('active') | list | length }} 條）</h2>
+<h2>正式連結（{{ n_real }} 條 valid{% if n_virtual %} ＋ {{ n_virtual }} 條待寫入{% endif %}／目標 {{ target }} 條）</h2>
 <table>
-<thead><tr><th>列</th><th>標題 / 規格</th><th>賣場</th><th>表上價</th><th>最新價</th>
-<th>狀態</th><th>Note</th><th>最後檢查</th></tr></thead>
+{{ link_head() }}
 <tbody>
-{% for l in links if l.active %}
-<tr>
-  <td class="dim">{{ l.sheet_row_hint or '' }}</td>
-  <td>
-    <a href="{{ l.canonical_url or l.raw_url }}" target="_blank">{{ (l.page_name or l.raw_url)[:70] }}</a>
-    <div class="dim">{{ l.variant_text or '' }}</div>
-  </td>
-  <td>{{ l.supplier or '' }}</td>
-  <td class="num">{{ '{:,}'.format(l.price_idr) if l.price_idr else '' }}</td>
-  <td class="num">{{ '{:,}'.format(l.last_price_idr) if l.last_price_idr else '' }}</td>
-  <td><span class="tag st-{{ l.status }}">{{ l.status }}</span>
-      <div class="dim">{{ l.status_detail or '' }}</div></td>
-  <td>{{ l.note or '' }}</td>
-  <td class="dim">{{ (l.last_checked_at or '')[:16] }}</td>
-</tr>
-{% endfor %}
+{% for l in official %}{{ link_row(l) }}{% endfor %}
 </tbody>
 </table>
-{% set inactive = links | rejectattr('active') | list %}
-{% if inactive %}<p class="dim">另有 {{ inactive | length }} 條已從表上消失的連結（active=0）</p>{% endif %}
+{% if not official %}<p class="dim">目前沒有 valid 連結；執行「檢查並補找連結」後會自動補足。</p>{% endif %}
 </section>
 
-{% if cands %}
 <section class="card">
-<h2>候選新連結</h2>
+<h2>備選區（{{ backup | length }} 條）</h2>
 <table>
-<thead><tr><th>標題 / 規格</th><th>賣場</th><th>地區</th><th>價格</th><th>銷量</th>
-<th>相似度</th><th>狀態</th><th></th></tr></thead>
+{{ link_head() }}
 <tbody>
-{% for c in cands %}
-<tr>
-  <td><a href="https://shopee.co.id/product/{{ c.shopid }}/{{ c.itemid }}" target="_blank">{{ (c.title or '')[:70] }}</a>
-      <div class="dim">{{ c.variant_text or '' }} {{ c.note or '' }}</div></td>
-  <td>{{ c.shop_name or '' }}</td>
-  <td>{{ c.shop_location or '' }}</td>
-  <td class="num">{{ '{:,}'.format(c.price_idr) if c.price_idr else '' }}</td>
-  <td class="num">{{ c.sold or 0 }}</td>
-  <td class="num">{{ '%.0f%%' % (c.image_sim * 100) if c.image_sim else '—' }}</td>
-  <td><span class="tag">{{ c.state }}</span></td>
-  <td>
-    {% if c.state == 'proposed' %}
-    <button onclick="cand({{ c.id }}, 'accept')">採用</button>
-    <button class="warn" onclick="cand({{ c.id }}, 'reject')">拒絕</button>
-    {% endif %}
-  </td>
-</tr>
-{% endfor %}
+{% for l in backup %}{{ link_row(l) }}{% endfor %}
 </tbody>
 </table>
+{% if not backup %}<p class="dim">備選區目前是空的。</p>{% endif %}
 </section>
-{% endif %}
 {% endblock %}
 {% block scripts %}
 <script>
 const CODE = {{ p.code | tojson }};
 async function saveBaseline() {
   const r = await api(`/api/products/${encodeURIComponent(CODE)}/baseline`, {
-    baseline_override_idr: document.getElementById('baseline').value,
+    baseline_idr: document.getElementById('baseline').value,
     high_cost_pct: document.getElementById('pct').value });
   if (r.ok) location.reload();
 }
-async function resetBaseline() {
-  const r = await api(`/api/products/${encodeURIComponent(CODE)}/baseline`, {
-    baseline_override_idr: '' });
-  if (r.ok) location.reload();
-}
-async function runJob(kind) {
-  const r = await api('/api/jobs', {kind, product_codes: [CODE]});
+async function runCheckFind() {
+  const r = await api('/api/jobs', {kind: 'check', product_codes: [CODE], include_find: true});
   if (r.ok) location.href = '/jobs/' + r.job_id;
-}
-async function cand(id, action) {
-  const r = await api(`/api/candidates/${id}/${action}`, {});
-  if (r.ok) location.reload();
 }
 </script>
 {% endblock %}

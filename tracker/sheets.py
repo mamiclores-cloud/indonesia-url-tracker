@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import threading
+import time
 
 from . import config as cfg
 from . import db
@@ -18,11 +19,16 @@ from . import linkparse
 log = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-COLS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]
+# L 欄 = 搜尋關鍵字驗證欄（客戶 1.2；J/K 是人工欄位不可用）。read-only 解析
+# 仍只看 A-I；L 只由程式寫入。
+COLS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
 
 # Machine-written note vocabulary. I-column values outside this set are human
 # notes and must never be overwritten (SPEC: 防蓋規則).
-MACHINE_NOTES = {"invalid", "sold out", "unlisted", "high cost"}
+# 舊詞彙（invalid/unlisted/high cost）必須保留——表上既有的舊機器 note 才能
+# 被新規則覆寫，否則會被當成人工備註永遠洗不掉。
+MACHINE_NOTES = {"invalid", "sold out", "unlisted", "high cost",
+                 "high_cost", "link error", "new"}
 
 
 class GoogleAuthNeeded(Exception):
@@ -36,6 +42,21 @@ _auth_flow_state = {"running": False, "error": None}
 
 
 def get_creds():
+    """服務帳戶優先，沒有才退回使用者 OAuth。
+
+    OAuth 同意畫面停在「測試中」(Testing) 發布狀態時，Google 發出的 refresh
+    token **固定 7 天後失效**——這正是 0803 apply #273 失敗的直接原因（授權於
+    07-27 19:35 完成、08-03 19:38 最後一次成功更新、當晚 23:34 即 invalid_grant）。
+    對一個無人值守、單趟跑幾十小時的批次工具來說，「每 7 天要有人去點瀏覽器
+    重新授權」是結構性的錯誤設計，所以改用服務帳戶：不過期、不需要瀏覽器。
+
+    使用前提：把試算表分享給 service_account.json 裡的 client_email（編輯者）。
+    """
+    if os.path.exists(cfg.SERVICE_ACCOUNT_PATH):
+        from google.oauth2 import service_account
+        return service_account.Credentials.from_service_account_file(
+            cfg.SERVICE_ACCOUNT_PATH, scopes=SCOPES)
+
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
@@ -44,7 +65,13 @@ def get_creds():
     creds = Credentials.from_authorized_user_file(cfg.GOOGLE_TOKEN_PATH, SCOPES)
     if not creds.valid:
         if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                # RefreshError（token 過期／被撤銷）不是「程式壞了」，是「要重新
+                # 授權」。讓它往外拋會把 /api/status 打成 500，連帶讓整個狀態列
+                # 與驗證碼橫幅失明（0803 就是這樣，log 被 traceback 灌到 8MB）。
+                raise GoogleAuthNeeded(f"Google 授權已失效，請重新授權：{e}")
             with open(cfg.GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
                 f.write(creds.to_json())
         else:
@@ -52,16 +79,89 @@ def get_creds():
     return creds
 
 
+def auth_mode():
+    return "service_account" if os.path.exists(cfg.SERVICE_ACCOUNT_PATH) else "oauth"
+
+
+def service_account_email():
+    try:
+        with open(cfg.SERVICE_ACCOUNT_PATH, "r", encoding="utf-8") as f:
+            return json.load(f).get("client_email", "")
+    except (OSError, ValueError):
+        return ""
+
+
+_access_cache = {"at": 0.0, "ok": None, "error": None}
+ACCESS_TTL_S = 300
+
+
+def check_access(force=False):
+    """憑證有效 ≠ 拿得到那張表。
+
+    服務帳戶是一個獨立的 Google 身分，試算表必須先分享給它，否則所有呼叫都是
+    403。這一步是一次輕量的 metadata 呼叫，讓狀態說的是「真的能寫嗎」而不是
+    「憑證檔存在嗎」。
+
+    **會發網路請求**，所以只在背景刷新與 apply 開跑前呼叫；每 3 秒一次的
+    /api/status 走 access_status() 讀快取，絕不在同步路徑做 I/O。
+
+    回傳 (ok, error_message)。永不外拋。
+    """
+    if not force and _access_cache["ok"] is not None \
+            and time.time() - _access_cache["at"] < ACCESS_TTL_S:
+        return _access_cache["ok"], _access_cache["error"]
+    ok, err = False, None
+    try:
+        url = (f"https://sheets.googleapis.com/v4/spreadsheets/{cfg.get('sheet_id')}"
+               "?fields=properties.title")
+        r = api_call(_session().get, url, retries=1, timeout=10)
+        ok = r.status_code == 200
+        if not ok:
+            err = f"HTTP {r.status_code}: {r.text[:160]}"
+            if r.status_code in (403, 404) and auth_mode() == "service_account":
+                err = f"請把試算表分享給服務帳戶 {service_account_email()}（編輯者權限）"
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    _access_cache.update(at=time.time(), ok=ok, error=err)
+    return ok, err
+
+
+def access_status():
+    """純讀快取，不做任何 I/O。尚未檢查過時回 (None, None)。"""
+    return _access_cache["ok"], _access_cache["error"]
+
+
+def start_access_refresher():
+    """背景定期確認「還拿得到那張表嗎」。權限被撤、試算表被改名或刪除，
+    都該在狀態列上看得到，而不是等到 apply 寫到一半才發現。"""
+    def run():
+        while True:
+            try:
+                check_access(force=True)
+            except Exception:
+                log.exception("access refresh failed")
+            time.sleep(ACCESS_TTL_S)
+
+    threading.Thread(target=run, name="sheets-access", daemon=True).start()
+
+
 def auth_status():
+    """永不外拋——任一子系統故障都不該讓 /api/status 整個掛掉。"""
+    base = {"mode": auth_mode(), "flow_running": _auth_flow_state["running"],
+            "error": _auth_flow_state["error"]}
     try:
         get_creds()
-        return {"ok": True, "flow_running": _auth_flow_state["running"],
-                "error": _auth_flow_state["error"]}
+        ok, err = access_status()          # 快取，不發網路請求
+        if ok is False:
+            return dict(base, ok=False, reason=err)
+        return dict(base, ok=True, access_checked=ok is True)
     except GoogleAuthNeeded as e:
-        return {"ok": False, "reason": str(e),
-                "has_client_secret": os.path.exists(cfg.CLIENT_SECRET_PATH),
-                "flow_running": _auth_flow_state["running"],
-                "error": _auth_flow_state["error"]}
+        return dict(base, ok=False, reason=str(e),
+                    has_client_secret=os.path.exists(cfg.CLIENT_SECRET_PATH))
+    except Exception as e:
+        log.warning("auth_status 失敗：%s", e)
+        return dict(base, ok=False, reason=f"{type(e).__name__}: {e}",
+                    has_client_secret=os.path.exists(cfg.CLIENT_SECRET_PATH))
 
 
 def start_auth_flow():
@@ -130,12 +230,12 @@ FIELDS_MASK = ("sheets(properties(sheetId,title),"
 def read_google(ranges=None):
     """Pull grid data (values + hyperlinks) from the live sheet."""
     ws = cfg.get("worksheet_name")
-    ranges = ranges or [f"{ws}!A1:K"]
+    ranges = ranges or [f"{ws}!A1:L"]
     sess = _session()
     params = [("includeGridData", "true"), ("fields", FIELDS_MASK)]
     params += [("ranges", r) for r in ranges]
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{cfg.get('sheet_id')}"
-    resp = sess.get(url, params=params, timeout=180)
+    resp = api_call(sess.get, url, params=params, timeout=180)
     resp.raise_for_status()
     payload = resp.json()
     sheet = None
@@ -246,7 +346,10 @@ def parse_rows(rows):
             prev_code = code
         if not is_link_row(row):
             continue
-        raw_url = row["h_url"] or row["vals"]["H"].strip()
+        # 0801 修正單：儲存格顯示文字優先（客戶要求抓儲存格中的連結文字，
+        # 不抓附掛的短網址 hyperlink）；文字不是 URL 才退回 hyperlink/公式。
+        h_text = row["vals"]["H"].strip()
+        raw_url = h_text if h_text.startswith("http") else (row["h_url"] or h_text)
         links.append({
             "product_code": code,
             "sheet_row": row["row"],
@@ -277,8 +380,54 @@ def enrich_link_ids(link):
     return link
 
 
+def seed_baselines(parse_min=None):
+    """Seed products.baseline_idr for products that don't have one yet.
+
+    客戶規則：基準價 = 該商品「未執行查詢前」表上 E 欄最低價，只定植一次，
+    之後僅人工可改。程式已回寫過部分 E 欄，所以優先讀 xlsx 原始快照；
+    快照沒有的商品用 parse_min（本次拉取各 code 最低價）或 mirror 最低價
+    （排除程式插入的 origin='found' 列）。
+    """
+    unseeded = [r["code"] for r in db.q("SELECT code FROM products WHERE baseline_idr IS NULL")]
+    if not unseeded:
+        return {"seeded": 0}
+    snapshot_min = {}
+    if os.path.exists(cfg.XLSX_PATH):
+        try:
+            _, snap_links, _ = parse_rows(read_xlsx())
+            for lk in snap_links:
+                p = lk["price_idr"]
+                if p and p > 0:
+                    code = lk["product_code"]
+                    if code not in snapshot_min or p < snapshot_min[code]:
+                        snapshot_min[code] = p
+        except Exception:
+            log.exception("xlsx snapshot read failed; baseline falls back to mirror prices")
+    seeded = 0
+    for code in unseeded:
+        base = snapshot_min.get(code) or (parse_min or {}).get(code)
+        if base is None:
+            row = db.q1("SELECT MIN(price_idr) AS m FROM links WHERE product_code=? AND active=1 "
+                        "AND origin='sheet' AND price_idr>0", (code,))
+            base = row["m"] if row else None
+        if base:
+            db.x("UPDATE products SET baseline_idr=? WHERE code=? AND baseline_idr IS NULL",
+                 (base, code))
+            seeded += 1
+    if seeded:
+        log.info("baseline seeded for %d products", seeded)
+    return {"seeded": seeded}
+
+
 def sync_mirror(rows):
-    """Upsert parsed sheet rows into SQLite. Identity: (product_code, raw_url)."""
+    """Upsert parsed sheet rows into SQLite.
+
+    身分比對（0801 修正單）：先 (product_code, raw_url) 精確比對；沒中再用
+    dedupe_key（shopid.itemid）在同商品內找未匹配的舊列「就地更新 raw_url」——
+    同一儲存格在不同次拉取抽出的 URL 字串可能不同（hyperlink vs 文字、編碼
+    差異），不能因此把舊列當成已從表上刪除。最後做幻影收斂：同 dedupe_key
+    的殘餘 inactive 舊列併入本次匹配到的列（純 DB 整理，Sheet 永遠不動）。
+    """
     products, links, _ = parse_rows(rows)
     c = db.conn()
     with c:
@@ -290,29 +439,82 @@ def sync_mirror(rows):
         # Deactivate ALL links first, then reactivate whatever the sheet still
         # has. A 'found' link that was written to the sheet but later deleted by
         # a human must also drop to active=0 — otherwise it lingers as a phantom
-        # valid link and can be re-picked as a finder source. (Rows still present
-        # are re-added below as origin='sheet', active=1.)
+        # valid link and can be re-picked as a finder source. 本交易內
+        # active=1 == 本次拉取有匹配到，dedupe fallback 據此只認領 active=0 列。
         c.execute("UPDATE links SET active=0")
         for lk in links:
             enrich_link_ids(lk)
-            c.execute(
-                """INSERT INTO links(product_code, sheet_row_hint, raw_url, canonical_url,
-                     shopid, itemid, model_id, dedupe_key, page_name, variant_text,
-                     price_idr, supplier, note, active, origin)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,'sheet')
-                   ON CONFLICT(product_code, raw_url) DO UPDATE SET
-                     sheet_row_hint=excluded.sheet_row_hint,
-                     canonical_url=COALESCE(excluded.canonical_url, links.canonical_url),
-                     shopid=COALESCE(excluded.shopid, links.shopid),
-                     itemid=COALESCE(excluded.itemid, links.itemid),
-                     model_id=COALESCE(excluded.model_id, links.model_id),
-                     dedupe_key=CASE WHEN excluded.dedupe_key!='' THEN excluded.dedupe_key ELSE links.dedupe_key END,
-                     page_name=excluded.page_name, variant_text=excluded.variant_text,
-                     price_idr=excluded.price_idr, supplier=excluded.supplier,
-                     note=excluded.note, active=1, origin='sheet'""",
-                (lk["product_code"], lk["sheet_row"], lk["raw_url"], lk["canonical_url"],
-                 lk["shopid"], lk["itemid"], lk["model_id"], lk["dedupe_key"],
-                 lk["page_name"], lk["variant_text"], lk["price_idr"], lk["supplier"], lk["note"]))
+            row = c.execute("SELECT id FROM links WHERE product_code=? AND raw_url=?",
+                            (lk["product_code"], lk["raw_url"])).fetchone()
+            if row is None and lk["dedupe_key"]:
+                # 同商品同 dedupe_key 且未被本次認領的舊列 = 同一連結換了字串
+                # 表示 → 就地更新 raw_url（優先取有檢查歷史者、再最舊）。
+                # 精確比對沒中代表沒有列持有新 raw_url，這裡不會撞 UNIQUE。
+                row = c.execute(
+                    "SELECT id FROM links WHERE product_code=? AND dedupe_key=? AND active=0 "
+                    "ORDER BY (last_checked_at IS NULL), id LIMIT 1",
+                    (lk["product_code"], lk["dedupe_key"])).fetchone()
+                if row is not None:
+                    c.execute("UPDATE links SET raw_url=? WHERE id=?", (lk["raw_url"], row["id"]))
+            if row is not None:
+                c.execute(
+                    """UPDATE links SET sheet_row_hint=?,
+                         canonical_url=COALESCE(?, canonical_url),
+                         shopid=COALESCE(?, shopid), itemid=COALESCE(?, itemid),
+                         model_id=COALESCE(?, model_id),
+                         dedupe_key=CASE WHEN ?!='' THEN ? ELSE dedupe_key END,
+                         page_name=?, variant_text=?, price_idr=?, supplier=?,
+                         note=?, active=1, origin='sheet' WHERE id=?""",
+                    (lk["sheet_row"], lk["canonical_url"], lk["shopid"], lk["itemid"],
+                     lk["model_id"], lk["dedupe_key"], lk["dedupe_key"],
+                     lk["page_name"], lk["variant_text"], lk["price_idr"],
+                     lk["supplier"], lk["note"], row["id"]))
+            else:
+                c.execute(
+                    """INSERT INTO links(product_code, sheet_row_hint, raw_url, canonical_url,
+                         shopid, itemid, model_id, dedupe_key, page_name, variant_text,
+                         price_idr, supplier, note, active, origin)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,'sheet')""",
+                    (lk["product_code"], lk["sheet_row"], lk["raw_url"], lk["canonical_url"],
+                     lk["shopid"], lk["itemid"], lk["model_id"], lk["dedupe_key"],
+                     lk["page_name"], lk["variant_text"], lk["price_idr"], lk["supplier"], lk["note"]))
+        # 幻影收斂：同 (product_code, dedupe_key) 既有本次匹配到的列（active=1）
+        # 又有殘餘 inactive 舊列時，舊列只是同一連結的舊字串身分——把檢查歷史
+        # 併入倖存者後刪除 DB 列（Sheet 不動）。兩列都在表上（都 active=1）
+        # 絕不合併（同商品確實可能有兩列同款連結）；dedupe_key 空字串絕不合併。
+        dups = c.execute(
+            """SELECT product_code, dedupe_key FROM links WHERE dedupe_key!=''
+               GROUP BY product_code, dedupe_key
+               HAVING SUM(active)>=1 AND SUM(1-active)>=1""").fetchall()
+        for d in dups:
+            survivor = c.execute(
+                "SELECT id, status FROM links WHERE product_code=? AND dedupe_key=? AND active=1 "
+                "ORDER BY (last_checked_at IS NULL), id LIMIT 1",
+                (d["product_code"], d["dedupe_key"])).fetchone()
+            phantoms = c.execute(
+                "SELECT * FROM links WHERE product_code=? AND dedupe_key=? AND active=0",
+                (d["product_code"], d["dedupe_key"])).fetchall()
+            for ph in phantoms:
+                cur = c.execute("SELECT status FROM links WHERE id=?", (survivor["id"],)).fetchone()
+                if cur["status"] == "unchecked" and ph["last_checked_at"]:
+                    # 倖存者是改名後新建的空殼列時，把幻影的檢查歷史搬過來
+                    c.execute(
+                        """UPDATE links SET status=?, status_detail=?, last_price_idr=?,
+                             prev_price_idr=?, last_checked_at=?, shop_location=?, sold=?,
+                             search_keyword=COALESCE(search_keyword, ?) WHERE id=?""",
+                        (ph["status"], ph["status_detail"], ph["last_price_idr"],
+                         ph["prev_price_idr"], ph["last_checked_at"], ph["shop_location"],
+                         ph["sold"], ph["search_keyword"], survivor["id"]))
+                c.execute("DELETE FROM links WHERE id=?", (ph["id"],))
+    # 新商品第一次進系統時定植基準價（此時表上價格必然是「查詢前」的）
+    parse_min = {}
+    for lk in links:
+        p = lk["price_idr"]
+        if p and p > 0:
+            code = lk["product_code"]
+            if code not in parse_min or p < parse_min[code]:
+                parse_min[code] = p
+    seed_baselines(parse_min)
     db.setting_set("last_sync_at", db.now())
     return {"products": len(products), "links": len(links)}
 
@@ -333,6 +535,60 @@ def is_machine_note(note: str) -> bool:
 
 def _col_range(ws, col, row):
     return f"{ws}!{col}{row}"
+
+
+# Sheets API 配額是每使用者每分鐘 60 次請求；插一列要 4 次請求，數百列一次
+# 套用必然撞牆。主動節流到 55 次/分鐘，並對 429/5xx 指數退避重試，避免整批
+# 被標成 failed 還要人工重排。
+API_CALLS_PER_MIN = 55
+_api_times = []
+_api_lock = threading.Lock()
+
+
+def _throttle():
+    while True:
+        with _api_lock:
+            now = time.monotonic()
+            _api_times[:] = [t for t in _api_times if now - t < 60]
+            if len(_api_times) < API_CALLS_PER_MIN:
+                _api_times.append(now)
+                return
+            wait = 60 - (now - _api_times[0]) + 0.05
+        log.info("Sheets API 節流：等待 %.1fs", wait)
+        time.sleep(wait)
+
+
+def api_call(fn, *args, retries=5, **kwargs):
+    """Throttled Sheets API call with backoff on 429/5xx. `fn` is sess.get/post."""
+    delay = 2.0
+    for attempt in range(retries + 1):
+        _throttle()
+        resp = fn(*args, **kwargs)
+        if resp.status_code not in (429, 500, 502, 503, 504) or attempt == retries:
+            return resp
+        log.warning("Sheets API %s，%.0fs 後重試（第 %d 次）", resp.status_code, delay, attempt + 1)
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
+    return resp
+
+
+def _insert_value_batch(ws, new_row, code, p):
+    """新插入列的 values:batchUpdate payload（純函式，供測試斷言）。
+    0801 修正單：I 欄不再寫「new」——valid 連結 Note 必須空白，插列後 I 本來就空。"""
+    h_formula = f'=HYPERLINK("{p["url"]}")'
+    batch = [
+        # A 欄填上同樣的 product code（使用者要求：找到的新列也要標明所屬商品）
+        {"range": f"{ws}!A{new_row}",
+         "values": [[p.get("product_code", code)]]},
+        {"range": f"{ws}!C{new_row}:E{new_row}",
+         "values": [[p.get("page_name", ""), p.get("variant_text", ""), p.get("price_idr")]]},
+        {"range": f"{ws}!G{new_row}:H{new_row}",
+         "values": [[p.get("supplier", ""), h_formula]]},
+    ]
+    # 客戶 1.2：把找此連結用的搜尋關鍵字寫在同列 L 欄供人工驗證
+    if p.get("search_keyword") and cfg.get("record_keyword_to_sheet", True):
+        batch.append({"range": f"{ws}!L{new_row}", "values": [[p["search_keyword"]]]})
+    return batch
 
 
 class Relocator:
@@ -401,6 +657,19 @@ def apply_writes(write_ids, progress=None):
              (db.now(), w["id"]))
         results["written"] += 1
 
+    def mirror_cell_write(w):
+        # keep the local mirror in step so the UI reflects the sheet immediately
+        # instead of waiting for the next pull
+        p = db.jload(w["payload_json"], {})
+        raw = p.get("raw_url", "")
+        if w["kind"] == "update_price":
+            db.x("UPDATE links SET price_idr=? WHERE product_code=? AND raw_url=?",
+                 (p.get("price_idr"), w["product_code"], raw))
+        else:
+            note = "" if w["kind"] == "clear_note" else p.get("note", "")
+            db.x("UPDATE links SET note=? WHERE product_code=? AND raw_url=?",
+                 (note, w["product_code"], raw))
+
     # ---- phase 1: cell updates -------------------------------------------
     value_data, done_cell_writes = [], []
     for w in writes:
@@ -426,7 +695,7 @@ def apply_writes(write_ids, progress=None):
         done_cell_writes.append(w)
 
     if value_data:
-        resp = sess.post(f"{base}/values:batchUpdate", json={
+        resp = api_call(sess.post, f"{base}/values:batchUpdate", json={
             "valueInputOption": "USER_ENTERED", "data": value_data}, timeout=120)
         if resp.status_code != 200:
             for w in done_cell_writes:
@@ -435,9 +704,11 @@ def apply_writes(write_ids, progress=None):
         else:
             for w in done_cell_writes:
                 mark_written(w)
+                mirror_cell_write(w)
     else:
         for w in done_cell_writes:
             mark_written(w)
+            mirror_cell_write(w)
     if progress:
         progress(len(done_cell_writes), len(writes))
 
@@ -456,25 +727,16 @@ def apply_writes(write_ids, progress=None):
                 "range": {"sheetId": sheet_num, "dimension": "ROWS",
                           "startIndex": last, "endIndex": last + 1},
                 "inheritFromBefore": True}}]
-            r1 = sess.post(f"{base}:batchUpdate", json={"requests": reqs}, timeout=60)
+            r1 = api_call(sess.post, f"{base}:batchUpdate", json={"requests": reqs}, timeout=60)
             r1.raise_for_status()
 
-            h_formula = f'=HYPERLINK("{p["url"]}")'
-            r2 = sess.post(f"{base}/values:batchUpdate", json={
-                "valueInputOption": "USER_ENTERED",
-                "data": [
-                    # A 欄填上同樣的 product code（使用者要求：找到的新列也要標明所屬商品）
-                    {"range": f"{ws}!A{new_row}",
-                     "values": [[p.get("product_code", code)]]},
-                    {"range": f"{ws}!C{new_row}:E{new_row}",
-                     "values": [[p.get("page_name", ""), p.get("variant_text", ""), p.get("price_idr")]]},
-                    {"range": f"{ws}!G{new_row}:H{new_row}",
-                     "values": [[p.get("supplier", ""), h_formula]]},
-                ]}, timeout=60)
+            value_batch = _insert_value_batch(ws, new_row, code, p)
+            r2 = api_call(sess.post, f"{base}/values:batchUpdate", json={
+                "valueInputOption": "USER_ENTERED", "data": value_batch}, timeout=60)
             r2.raise_for_status()
 
             # F formula copied from the row above (SPEC: 向下複製)
-            r3 = sess.post(f"{base}:batchUpdate", json={"requests": [{"copyPaste": {
+            r3 = api_call(sess.post, f"{base}:batchUpdate", json={"requests": [{"copyPaste": {
                 "source": {"sheetId": sheet_num, "startRowIndex": last - 1, "endRowIndex": last,
                            "startColumnIndex": 5, "endColumnIndex": 6},
                 "destination": {"sheetId": sheet_num, "startRowIndex": last, "endRowIndex": last + 1,
@@ -483,7 +745,7 @@ def apply_writes(write_ids, progress=None):
             r3.raise_for_status()
 
             # read back verification
-            r4 = sess.get(f"{base}/values/{ws}!C{new_row}:H{new_row}",
+            r4 = api_call(sess.get, f"{base}/values/{ws}!C{new_row}:H{new_row}",
                           params={"valueRenderOption": "FORMULA"}, timeout=60)
             r4.raise_for_status()
             got = (r4.json().get("values") or [[]])[0]
@@ -498,15 +760,16 @@ def apply_writes(write_ids, progress=None):
         reloc.shift_after(last)
         reloc.last_row[code] = new_row
         mark_written(w)
-        # mirror into links
+        # mirror into links（地區/銷量/關鍵字帶入，待下次檢查以 PDP 值覆蓋）
         db.x("""INSERT INTO links(product_code, sheet_row_hint, raw_url, canonical_url, shopid, itemid,
                   model_id, dedupe_key, page_name, variant_text, price_idr, supplier, note,
-                  status, origin, active, last_checked_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'found',1,?)
+                  status, origin, active, last_checked_at, shop_location, sold, search_keyword)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'found',1,?,?,?,?)
                 ON CONFLICT(product_code, raw_url) DO UPDATE SET active=1, sheet_row_hint=excluded.sheet_row_hint""",
              (code, new_row, p["url"], p["url"], p.get("shopid"), p.get("itemid"),
               w["model_id"], w["dedupe_key"] or "", p.get("page_name", ""), p.get("variant_text", ""),
-              p.get("price_idr"), p.get("supplier", ""), "", "valid", db.now()))
+              p.get("price_idr"), p.get("supplier", ""), "", "valid", db.now(),
+              p.get("shop_location", ""), p.get("sold"), p.get("search_keyword", "")))
         if p.get("candidate_id"):
             db.x("UPDATE candidates SET state='written' WHERE id=?", (p["candidate_id"],))
         if progress:

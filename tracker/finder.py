@@ -2,9 +2,11 @@
 gate → rank (price first, sold tiebreak, sold<100 excluded) → PDP confirm →
 propose candidates for review.
 """
+import difflib
 import json
 import logging
 import re
+import time
 
 from . import checker
 from . import config as cfg
@@ -30,7 +32,7 @@ KEYWORD_TITLE_MIN = 3
 # Hard cap on PDP-confirm navigations per find run — bounds worst-case runtime
 # (each PDP is paced 3–8s). A product that can't be filled stops instead of
 # grinding through every location tier.
-MAX_PDP_CONFIRMS = 8
+MAX_PDP_CONFIRMS = 15
 
 
 def expand_find(params):
@@ -42,12 +44,18 @@ def expand_find(params):
 
 def _tokens(text):
     t = re.sub(r"\[[^\]]*\]", " ", text or "")        # [BPOM] style tags
-    t = t.split("|")[0]                                # size lists after pipes
+    t = re.sub(r"(\d+)\s+(ml|gr|g|gram|pcs|pc|sachet|l)\b", r"\1\2", t, flags=re.I)
+    # Text after a pipe is usually a size list, but some sheet rows lead with the
+    # shop name instead ("Serafina♣ | [SCARLET] WHITENING BODY SCRUB …") — cutting
+    # there would leave the keyword with no product words at all.
+    head = t.split("|")[0]
+    if len(head.split()) >= 3:
+        t = head
     t = re.sub(r"[^\w\s一-鿿+&.-]", " ", t)            # emoji / decorations
     t = re.sub(r"\s+", " ", t).strip()
     seen, out = set(), []
     for tok in t.split(" "):
-        if not tok:
+        if not tok or not re.search(r"\w", tok):   # drop pure punctuation ("-")
             continue
         key = tok.lower()
         if key in seen:
@@ -57,26 +65,72 @@ def _tokens(text):
     return out
 
 
+def _spec_tokens(variant_text, brand, base, limit=2):
+    """D 欄的「選項規格」詞（客戶 1.2：品牌＋選項規格＋容量）。
+
+    同系列商品的 C 欄往往完全相同（九款 Fresh Care 香味共用一個標題），
+    分辨它們的唯一線索在 D 欄：sandalwood / lavender / citrus。沒有這些詞，
+    九個商品會用同一組關鍵字搜尋，找回來的必然是錯的香味。
+
+    排除四類雜訊：容量（另外附加）、長度<4 的縮寫（SC / SCT / FW）、品牌或
+    其縮寫（FCare→FreshCare 相似度 0.71）、以及標題開頭已有的詞。取最後
+    limit 個——規格詞在 D 欄通常押後（「Minyak Angin Citrus」的 Citrus、
+    「SC Sabun Charming」的 Charming）。
+    """
+    bnorm = checker.normalize_variant(brand).replace(" ", "") if brand else ""
+    base_norm = [checker.normalize_variant(t) for t in base]
+    out, seen = [], set()
+    for tok in re.split(r"[^\w一-鿿]+", variant_text or ""):
+        if len(tok) < 4 or SIZE_RE.fullmatch(tok):
+            continue
+        n = checker.normalize_variant(tok)
+        if not n or n in seen:
+            continue
+        if bnorm and (n in bnorm or bnorm in n
+                      or difflib.SequenceMatcher(None, n, bnorm).ratio() >= 0.6):
+            continue
+        # 標題開頭已有的詞（含縮寫變體，如標題的 Care 對上 D 欄的 FCare）
+        if any(b == n or difflib.SequenceMatcher(None, n, b).ratio() >= 0.8
+               for b in base_norm):
+            continue
+        seen.add(n)
+        out.append(tok)
+    return out[-limit:]
+
+
 def build_keyword(title, variant_text, attempt=1, brand=None):
-    """Brand + leading product words + size. The brand is critical: Shopee
-    titles often bury it inside a bracketed tag ("[SKINTIFIC CERTIFIED] …")
-    that _tokens strips, and without it the search returns unrelated goods."""
+    """Brand + leading product words + size（客戶 1.2：品牌＋商品名＋容量）。
+    The brand is critical: Shopee titles often bury it inside a bracketed tag
+    ("[SKINTIFIC CERTIFIED] …") that _tokens strips, and without it the search
+    returns unrelated goods."""
     toks = [t for t in _tokens(title) if not SIZE_RE.fullmatch(t)]
+    # C 欄常見「賣家名 - 商品名」前綴；已知品牌時，從品牌出現處起算，
+    # 把前面的賣家名裁掉（客戶 1.2：應先判斷品牌）
+    if brand and brand.strip():
+        b = brand.strip().lower()
+        for i, t in enumerate(toks):
+            if t.lower() == b:
+                if i:
+                    toks = toks[i:]
+                break
     n = 6 if attempt == 1 else 4
     base = toks[:n]
     size = None
-    m = SIZE_RE.search((variant_text or "").replace(" ", ""))
+    m = SIZE_RE.search(variant_text or "")
     if m:
         size = m.group(0)
     else:
         m = SIZE_RE.search(title or "")
         if m:
             size = m.group(0)
-    parts = base
+    parts = base + _spec_tokens(variant_text, brand, base)
     if brand and brand.strip():
-        low = [t.lower() for t in base[:2]]
-        if brand.strip().lower() not in low:
-            parts = [brand.strip()] + base
+        # Compare space-stripped so a multi-word brand ("Fresh Care") isn't
+        # prepended again onto a title that already starts with it.
+        bkey = checker.normalize_variant(brand).replace(" ", "")
+        head = checker.normalize_variant(" ".join(base[:3])).replace(" ", "")
+        if bkey and not head.startswith(bkey):
+            parts = [brand.strip()] + parts
     kw = " ".join(parts)
     if size:
         kw = f"{kw} {size}"
@@ -108,12 +162,9 @@ def _location_ok(shop_location, tier):
 
 
 def _confirm_rank(r):
-    """PDP-confirm priority: higher image-similarity band first, cheapest (then
-    best-selling) within a band. Keeps SPEC's price priority among equally
-    likely matches while not wasting confirms on loose low-similarity items."""
-    sim = r.get("sim") or 0
-    band = 0 if sim >= 0.7 else 1 if sim >= 0.6 else 2 if sim >= 0.5 else 3
-    return (band, r["price_idr"], -(r["sold"] or 0))
+    """PDP-confirm order（客戶 1.1）：純價格由低到高、同價銷量高者先，
+    依序開商品頁確認規格。相似度只作納入門檻，不參與排序。"""
+    return (r["price_idr"], -(r["sold"] or 0))
 
 
 def _product_tokens(keyword, brand):
@@ -177,9 +228,23 @@ def run_find_links(job, item):
     sim_threshold = float(db.setting_get("image_sim_calibrated") or cfg.get("image_sim_threshold"))
     drv = shopee.get_driver()
 
+    deadline = time.monotonic() + float(cfg.get("find_time_budget_s") or 0 or 1e9)
+
     n_valid = db.q1("SELECT COUNT(*) AS n FROM links WHERE product_code=? AND active=1 AND status='valid'",
                     (code,))["n"]
-    already = db.q1("SELECT COUNT(*) AS n FROM candidates WHERE product_code=? AND state IN ('proposed','accepted')",
+    # 客戶 Q&A：缺幾補幾。殘留的舊 proposed 候選會佔用名額（造成「缺 1 找 3」
+    # 的假象），先全部標 expired；只有已 accept 未寫入的仍算在途數量。
+    db.x("UPDATE candidates SET state='expired' WHERE product_code=? AND state='proposed'", (code,))
+    # 孤兒 accepted（對應的 insert 寫入已被丟棄/失敗/寫完）不再佔名額，
+    # 否則 need 會被永久壓縮成「缺 2 只找 1」。寫完的由 links 鏡射列接手擋重複。
+    db.x("""UPDATE candidates SET state='expired'
+            WHERE product_code=? AND state='accepted'
+              AND NOT EXISTS (SELECT 1 FROM pending_writes w
+                              WHERE w.kind='insert_link_row' AND w.state='pending'
+                                AND w.product_code=candidates.product_code
+                                AND w.dedupe_key = candidates.shopid || '.' || candidates.itemid)""",
+         (code,))
+    already = db.q1("SELECT COUNT(*) AS n FROM candidates WHERE product_code=? AND state='accepted'",
                     (code,))["n"]
     need = target_n - n_valid - already
     if need <= 0:
@@ -194,7 +259,10 @@ def run_find_links(job, item):
     if not keyword_only:
         parsed, _ = drv.get_pdp(src["canonical_url"] or src["raw_url"])
         if parsed.get("exists"):
-            src_title = parsed.get("title") or src_title
+            # 客戶 1.2：關鍵字以表上 C 欄文字為基底（人工整理過的商品名）；
+            # PDP title 只在 C 欄空白時補位，brand 仍取自 PDP
+            if not (src_title or "").strip():
+                src_title = parsed.get("title") or ""
             src_brand = parsed.get("brand")
             model, _how = checker.match_variant(src["variant_text"], parsed["models"], src["model_id"])
             # Reference = the SELECTED variant's own image (from tier_variations,
@@ -217,21 +285,44 @@ def run_find_links(job, item):
         else:
             keyword_only = True
 
+    if not src_brand:
+        # D 欄逗號尾段常是品牌（例「LOW PH 80ml, Skintific」→ Skintific）。
+        # 僅接受單一字的尾段——多字尾段（如「CLEANSER Skintific」）多半是規格
+        parts = [p.strip() for p in (src_variant or "").split(",") if p.strip()]
+        if len(parts) >= 2 and len(parts[-1].split()) == 1 and not SIZE_RE.search(parts[-1]):
+            src_brand = parts[-1]
+
     # dedupe only against links CURRENTLY in the sheet (active=1) — a link the
     # user removed from the sheet should be findable again (SPEC: 與現有連結不重複)
     existing = {r["dedupe_key"] for r in db.q(
         "SELECT dedupe_key FROM links WHERE product_code=? AND dedupe_key!='' AND active=1", (code,))}
+    # expired（僅是過期候選）可重新提案；rejected 是人工否決、仍要擋
     seen_cand = {f'{r["shopid"]}.{r["itemid"]}' for r in db.q(
-        "SELECT shopid, itemid FROM candidates WHERE product_code=?", (code,))}
+        "SELECT shopid, itemid FROM candidates WHERE product_code=? AND state!='expired'", (code,))}
 
-    summary = {"attempts": [], "proposed": 0, "keyword_only": keyword_only}
+    # 0802：補找只收「補上去就會是 valid」的連結——價格超過 high cost 門檻的
+    # 候選寫進表後下次檢查必然變 high_cost 掉回備選區（實測占已採用候選 31%）。
+    # 搜尋清單價是該賣場最低規格價，是實際規格價的下界，連它都超標就一定超標。
+    baseline = checker.effective_baseline(code)
+    pct = checker.high_cost_pct(code)
+    price_cap = baseline * (1 + pct / 100.0) if baseline else None
+
+    summary = {"attempts": [], "proposed": 0, "keyword_only": keyword_only,
+               "price_cap": int(price_cap) if price_cap else None}
     proposed = 0
     pdp_confirms = 0        # bound total PDP navigations so a run can't drag on
+    over_cap = 0            # 因價格超過門檻而略過的候選數（觀察用）
 
     for attempt in (1, 2):
+        if time.monotonic() > deadline:
+            summary["time_budget_hit"] = True
+            break
         kw = build_keyword(src_title, src_variant, attempt, brand=src_brand)
         if not kw:
             continue
+        # 記錄最後實際用於搜尋的關鍵字（客戶 1.2 驗證用；找不到連結時也看得到）
+        db.x("UPDATE products SET search_keyword=?, search_keyword_at=? WHERE code=?",
+             (kw, db.now(), code))
         # distinctive tokens from the cleaned keyword, NOT the raw title (the raw
         # title carries generic words like "minyak angin" that sibling products
         # also have, which would let them slip through)
@@ -241,6 +332,9 @@ def run_find_links(job, item):
         keyword_bad = False
 
         for tier_idx, tier in enumerate(cfg.get("location_tiers")):
+            if time.monotonic() > deadline:
+                summary["time_budget_hit"] = True
+                break
             results, _raw = drv.search(kw, _locations_for_tier(tier))
             tier_log = {"tier": tier_idx, "results": len(results), "passed": 0}
             attempt_log["tiers"].append(tier_log)
@@ -292,6 +386,10 @@ def run_find_links(job, item):
                      and (r["sold"] or 0) >= min_sold
                      and r.get("price_idr")
                      and not r.get("is_sold_out")]
+            if price_cap:
+                keep = [r for r in cands if r["price_idr"] <= price_cap]
+                over_cap += len(cands) - len(keep)
+                cands = keep
             # Confirm order: by similarity band first (most-likely-genuine),
             # cheapest within each band. A low inclusion threshold otherwise
             # floods the pool with loose matches and the cheapest-first rule
@@ -305,6 +403,9 @@ def run_find_links(job, item):
             for r in cands[:max(need * 3, 4)]:
                 if proposed >= need or pdp_confirms >= MAX_PDP_CONFIRMS:
                     break
+                if time.monotonic() > deadline:
+                    summary["time_budget_hit"] = True
+                    break
                 url = linkparse.canonical_url(r["shopid"], r["itemid"])
                 pdp_confirms += 1
                 parsed, _ = drv.get_pdp(url)
@@ -313,19 +414,23 @@ def run_find_links(job, item):
                 model, how = checker.match_variant(src_variant, parsed["models"], allow_single_model=True)
                 if model is None or not model.get("price_idr") or model.get("in_stock") is False:
                     continue
+                # 實際選到的規格價才是會回填 E 欄的價；超過門檻就不採用
+                if price_cap and model["price_idr"] > price_cap:
+                    over_cap += 1
+                    continue
                 # D 欄：只有 1 個 model = 沒有可選規格 → "-"（SPEC：無選項顯示 -）；
                 # 內部 model 名（如空字串或「SKINTIFIC EYE CREAM」）不是使用者可選項目
                 n_models = len(parsed.get("models") or [])
                 variant_for_d = model["name"] if (n_models > 1 and (model.get("name") or "").strip()) else "-"
                 db.x("""INSERT INTO candidates(product_code, shopid, itemid, model_id, title,
                          variant_text, price_idr, sold, shop_name, shop_location, image_sim,
-                         tier, state, note, created_at)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'proposed',?,?)""",
+                         tier, state, note, search_keyword, created_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'proposed',?,?,?)""",
                      (code, r["shopid"], r["itemid"], model["model_id"] if n_models > 1 else None,
                       parsed.get("title") or r["title"], variant_for_d, model["price_idr"],
                       r["sold"], parsed.get("shop_name") or "", r["shop_location"],
                       r.get("sim"), tier_idx,
-                      "需人工確認（無圖片驗證）" if keyword_only else "", db.now()))
+                      "需人工確認（無圖片驗證）" if keyword_only else "", kw, db.now()))
                 seen_cand.add(f'{r["shopid"]}.{r["itemid"]}')
                 proposed += 1
 
@@ -336,10 +441,16 @@ def run_find_links(job, item):
 
     summary["proposed"] = proposed
     summary["pdp_confirms"] = pdp_confirms
+    summary["over_price_cap"] = over_cap
     if proposed == 0:
         db.x("UPDATE products SET updated_at=? WHERE code=?", (db.now(), code))
-        summary["note"] = ("關鍵字比對失敗，需人工設定關鍵字" if keyword_bad
-                           else "第一頁無合格結果")
+        if summary.get("time_budget_hit"):
+            summary["note"] = f"達單商品時間上限（{cfg.get('find_time_budget_s')} 秒），下次執行再補"
+        elif over_cap and not keyword_bad:
+            summary["note"] = f"第一頁結果都超過 high cost 門檻（略過 {over_cap} 個）"
+        else:
+            summary["note"] = ("關鍵字比對失敗，需人工設定關鍵字" if keyword_bad
+                               else "第一頁無合格結果")
     if cfg.get("auto_accept_candidates"):
         for r in db.q("SELECT id FROM candidates WHERE product_code=? AND state='proposed'", (code,)):
             accept_candidate(r["id"], job_id=job["id"])
@@ -356,6 +467,8 @@ def accept_candidate(cand_id, job_id=None):
         "page_name": c["title"], "variant_text": c["variant_text"],
         "price_idr": c["price_idr"], "supplier": c["shop_name"],
         "shopid": c["shopid"], "itemid": c["itemid"], "candidate_id": c["id"],
+        "shop_location": c["shop_location"], "sold": c["sold"],
+        "search_keyword": c["search_keyword"],
     }
     cur = db.x("""INSERT INTO pending_writes(job_id, kind, product_code, dedupe_key, model_id,
                    payload_json, state, created_at)

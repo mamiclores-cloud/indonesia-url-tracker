@@ -55,7 +55,6 @@ https://docs.google.com/spreadsheets/d/1DOTTepXR8OZ2wskuiz98ZE6yeplmGp0Ezk0SX_Z_
 - 如果篩選tagerang 和 Jakarta沒有好的連結，才解除掉篩選開始找其他地點 (由地理位置接近雅加達由近到遠)
 
 
-
 ## 回填及紀錄方式
 - 在現有連結的最後一個，向下插入一列
 - 並依序填入 Supplier Page name(C 欄)、Supplier Item name(D 欄)、Price (IDR)(E欄)、supplier's name(G欄)、Product link(H 欄)
@@ -63,9 +62,6 @@ https://docs.google.com/spreadsheets/d/1DOTTepXR8OZ2wskuiz98ZE6yeplmGp0Ezk0SX_Z_
 
 ## 建立資料庫和介面
 各項商品的有效連結除了在原表格上表示之外，也要建立一個可操作介面，讓我們可以查看和編輯各商品的訂購連結。
-
-
-
 
 ## 實際人工操作方式
 

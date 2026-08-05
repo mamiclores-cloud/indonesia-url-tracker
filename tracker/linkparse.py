@@ -80,7 +80,9 @@ def resolve_url(url: str, use_cache=True, timeout=15):
         return url
     if use_cache:
         row = db.q1("SELECT final_url FROM url_cache WHERE short_url=?", (url,))
-        if row and row["final_url"]:
+        # 只信任解到蝦皮的快取。舊版曾把 http→https 之類的假解析（short→short）
+        # 也寫進快取，若照用會永遠擋住瀏覽器 fallback。
+        if row and row["final_url"] and is_shopee(row["final_url"]):
             return row["final_url"]
     final = None
     try:
@@ -102,7 +104,9 @@ def resolve_url(url: str, use_cache=True, timeout=15):
     except requests.RequestException as e:
         log.warning("resolve_url failed for %s: %s", url, e)
         return None
-    if final and final != url:
+    # 只快取成功解到蝦皮的結果；非蝦皮 final 照樣回傳（checker 要拿去顯示
+    # 「非蝦皮連結」細節），但不入快取，下次仍有機會走瀏覽器解析。
+    if final and is_shopee(final):
         db.x("INSERT INTO url_cache(short_url, final_url, resolved_at) VALUES(?,?,?) "
              "ON CONFLICT(short_url) DO UPDATE SET final_url=excluded.final_url, resolved_at=excluded.resolved_at",
              (url, final, db.now()))

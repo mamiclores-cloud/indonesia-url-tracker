@@ -21,11 +21,16 @@ log = logging.getLogger(__name__)
 
 RAW_DIR = os.path.join(cfg.DATA_DIR, "raw")
 
+# 客戶 2.1 + 0801 修正單：Note 只用三種原因詞彙，且只要是 invalid 就一定有
+# Note。unlisted 歸 sold out；規格對不上（variant_error）視同該規格已下架，
+# 也歸 sold out；連結打不開/非蝦皮/解析失敗/抓取例外 = link error。valid 清空。
 NOTE_FOR_STATUS = {
-    "invalid": "invalid",
+    "invalid": "link error",
     "sold_out": "sold out",
-    "unlisted": "unlisted",
-    "high_cost": "high cost",
+    "unlisted": "sold out",
+    "variant_error": "sold out",
+    "high_cost": "high_cost",
+    "error": "link error",
     "valid": "",
 }
 
@@ -33,7 +38,8 @@ NOTE_FOR_STATUS = {
 # ------------------------------------------------------------- expansion ---
 
 def _checkable_links(codes=None, link_ids=None):
-    """Active sheet/found links that can be automated (shopee or resolvable)."""
+    """All active links. 客戶 1.3：短網址/非蝦皮不再預先跳過（manual 已移除），
+    一律進 fetch 嘗試解析，解析不了才標 invalid（Note: link error），流程繼續。"""
     if link_ids:
         rows = db.q(f"SELECT * FROM links WHERE id IN ({','.join('?'*len(link_ids))}) AND active=1",
                     link_ids)
@@ -42,21 +48,16 @@ def _checkable_links(codes=None, link_ids=None):
                     codes)
     else:
         rows = db.q("SELECT * FROM links WHERE active=1")
-    out = []
-    for r in rows:
-        kind = linkparse.classify_raw_url(r["raw_url"])
-        if kind == "other":
-            db.x("UPDATE links SET status='manual', status_detail='非蝦皮連結，需人工處理', last_checked_at=? WHERE id=?",
-                 (db.now(), r["id"]))
-            continue
-        out.append(dict(r))
-    return out
+    return [dict(r) for r in rows]
 
 
 def expand_check(params):
     links = _checkable_links(params.get("product_codes"), params.get("link_ids"))
     items = [{"kind": "fetch_link", "target": lk["id"]} for lk in links]
-    for code in sorted({lk["product_code"] for lk in links}):
+    codes = {lk["product_code"] for lk in links}
+    # 指定商品時，就算目前 0 條可查連結也要 classify（才會觸發補找）
+    codes.update(params.get("product_codes") or [])
+    for code in sorted(codes):
         items.append({"kind": "classify_product", "target": code})
     return items
 
@@ -146,15 +147,20 @@ def match_variant(variant_text, models, url_model_id=None, allow_single_model=Fa
 
 
 def resolve_link(link, drv=None):
-    """Ensure link has a usable shopee URL + ids. Returns final url or None."""
+    """Ensure link has a usable shopee URL + ids. Returns final url or None.
+
+    0801 修正單：requests 解析「停在非蝦皮網址」（短網址擋 UA / JS 跳轉時
+    常停在短網址本身）不算定案，改用瀏覽器實際載入追最終網址；只有瀏覽器
+    也解不到蝦皮才維持原判。成功解析一律入快取，之後免瀏覽器。"""
     url = link["raw_url"]
     if linkparse.is_shopee(url):
         return url
     final = linkparse.resolve_url(url)
-    if final is None and drv is not None:
-        final = drv.resolve_in_browser(url)
-        if final:
-            linkparse.cache_resolution(url, final)
+    if (final is None or not linkparse.is_shopee(final)) and drv is not None:
+        in_browser = drv.resolve_in_browser(url)
+        if in_browser and linkparse.is_shopee(in_browser):
+            linkparse.cache_resolution(url, in_browser)
+            return in_browser
     return final
 
 
@@ -171,9 +177,10 @@ def run_fetch_link(job, item):
              (db.now(), link["id"]))
         return {"outcome": "invalid", "detail": "短網址無法解析"}
     if not linkparse.is_shopee(final):
-        db.x("UPDATE links SET status='manual', status_detail=?, last_checked_at=? WHERE id=?",
-             (f"非蝦皮連結: {final[:120]}", db.now(), link["id"]))
-        return {"outcome": "manual", "final": final}
+        detail = f"非蝦皮連結: {final[:120]}"
+        db.x("UPDATE links SET status='invalid', status_detail=?, last_checked_at=? WHERE id=?",
+             (detail, db.now(), link["id"]))
+        return {"outcome": "invalid", "detail": detail, "final": final}
 
     ids = linkparse.parse_shopee_url(final)
     if not ids:
@@ -193,9 +200,18 @@ def run_fetch_link(job, item):
               "reason": parsed.get("reason"), "unlisted": parsed.get("unlisted", False),
               "title": parsed.get("title"), "shop_name": parsed.get("shop_name"),
               "images": (parsed.get("images") or [])[:1]}
+    if parsed.get("unknown_error"):
+        # 沒看過的 API 錯誤碼，而且系統已確認沒被擋 → 這條連結本身有問題，
+        # 但我們不知道是什麼問題。標 error 供人複核，絕不寫任何東西到表上。
+        result["outcome"] = "unknown_response"
+        return result
     if not parsed.get("exists"):
         result["outcome"] = "invalid"
         return result
+    # 地區/銷量回填（UI 正式連結區欄位）；PDP 抓不到就保留舊值
+    db.x("UPDATE links SET shop_location=COALESCE(NULLIF(?,''), shop_location), "
+         "sold=COALESCE(?, sold) WHERE id=?",
+         (parsed.get("shop_location") or "", parsed.get("historical_sold"), link["id"]))
 
     model, how = match_variant(link["variant_text"], parsed["models"], ids["model_id"])
     if model is None:
@@ -211,17 +227,12 @@ def run_fetch_link(job, item):
 
 # --------------------------------------------------------------- classify --
 
-def effective_baseline(code, fresh_prices):
-    """Baseline = override if set, else min price among this run's in-stock
-    links; falls back to min mirrored E of active links."""
-    prod = db.q1("SELECT * FROM products WHERE code=?", (code,))
-    if prod and prod["baseline_override_idr"]:
-        return prod["baseline_override_idr"], True
-    if fresh_prices:
-        return min(fresh_prices), False
-    row = db.q1("SELECT MIN(price_idr) AS m FROM links WHERE product_code=? AND active=1 AND price_idr>0",
-                (code,))
-    return (row["m"] if row and row["m"] else None), False
+def effective_baseline(code):
+    """客戶 1.5：基準價 = products.baseline_idr（一次性定植於
+    sheets.seed_baselines，程式永不自動變動，僅人工在 UI 修改）。
+    未定植（NULL）時回傳 None → 不判 high_cost。"""
+    prod = db.q1("SELECT baseline_idr FROM products WHERE code=?", (code,))
+    return prod["baseline_idr"] if prod else None
 
 
 def high_cost_pct(code):
@@ -246,32 +257,33 @@ def run_classify_product(job, item):
         if st_res:
             fresh[lk["id"]] = st_res
 
-    in_stock_prices = [
-        res.get("price_idr") for _, (st, res) in
-        ((k, v) for k, v in fresh.items())
-        if st == "done" and res.get("outcome") == "ok"
-        and res.get("price_idr") and res.get("in_stock") is not False
-    ]
-    baseline, overridden = effective_baseline(code, in_stock_prices)
+    baseline = effective_baseline(code)
     pct = high_cost_pct(code)
     threshold = baseline * (1 + pct / 100.0) if baseline else None
 
-    summary = {"baseline": baseline, "override": overridden, "pct": pct, "links": {}}
+    summary = {"baseline": baseline, "pct": pct, "links": {}}
     for lk in links:
         got = fresh.get(lk["id"])
         if got is None:
             continue
         st, res = got
+        # no_write：本次判定不可信到足以動客戶的表，只在本地留痕給人看
+        no_write = False
         if st == "failed":
+            # 抓取例外 → error → Note「link error」（0801 修正單：只要是 invalid
+            # 就一定有 Note）。註：這代表一次暫時性故障（CDP 斷線、逾時）也會把
+            # 連結標成失效並寫回表，可用任務頁的「重跑失敗項」修正。
             status, detail = "error", res.get("error", "fetch failed")
         else:
             outcome = res.get("outcome")
-            if outcome == "manual":
-                continue
+            if outcome == "unknown_response":
+                status = "error"
+                detail = f"{res.get('reason') or '未知回應'}（未下判定，待人工複核）"
+                no_write = True
             elif outcome == "invalid":
                 status, detail = "invalid", res.get("reason") or res.get("detail") or ""
             elif outcome == "variant_error":
-                status, detail = "error", res.get("detail", "variant not matched")
+                status, detail = "variant_error", res.get("detail", "variant not matched")
             elif outcome == "ok":
                 price = res.get("price_idr")
                 if res.get("unlisted"):
@@ -289,12 +301,19 @@ def run_classify_product(job, item):
                 status, detail = "error", f"unknown outcome {outcome}"
 
         price = res.get("price_idr")
-        db.x("UPDATE links SET status=?, status_detail=?, last_price_idr=COALESCE(?, last_price_idr), "
+        # 前次/最新價滾動（客戶 2.3）：本次有抓到價才滾動；首次檢查時
+        # last_price 為 NULL → 前次價自動落到表上 E 欄價
+        db.x("UPDATE links SET status=?, status_detail=?, "
+             "prev_price_idr=CASE WHEN ? IS NOT NULL THEN COALESCE(last_price_idr, price_idr) "
+             "  ELSE prev_price_idr END, "
+             "last_price_idr=COALESCE(?, last_price_idr), "
              "last_checked_at=? WHERE id=?",
-             (status, detail, price, db.now(), lk["id"]))
+             (status, detail, price, price, db.now(), lk["id"]))
         summary["links"][lk["id"]] = {"status": status, "price": price}
 
         # ---- pending writes ------------------------------------------------
+        if no_write:
+            continue
         if price and price != lk["price_idr"] and status in ("valid", "sold_out", "unlisted", "high_cost"):
             _queue_write(job["id"], "update_price", lk, {"price_idr": price, "raw_url": lk["raw_url"]})
         target_note = NOTE_FOR_STATUS.get(status)
@@ -312,10 +331,10 @@ def run_classify_product(job, item):
                     db.x("UPDATE links SET status_detail=? WHERE id=?",
                          (f"note conflict：人工備註「{current}」未覆寫（判定 {target_note}）", lk["id"]))
 
-    # full_scan: queue the finder for any product short of the target number of
-    # valid links (SPEC 原文為 ≤1，使用者要求改為「不到 3 個就找」)
+    # 一鍵流程（客戶 2.4）：check job 帶 include_find=true（或 full_scan 預設）
+    # 時，檢查完 valid 不足 3 條就動態追加 find item（缺幾補幾在 finder 內算）
     params = db.jload(job["params_json"], {})
-    if job["kind"] == "full_scan" and params.get("include_find", True):
+    if params.get("include_find", job["kind"] == "full_scan"):
         n_valid = db.q1("SELECT COUNT(*) AS n FROM links WHERE product_code=? AND active=1 AND status='valid'",
                         (code,))["n"]
         if n_valid < int(cfg.get("target_links_per_product")):

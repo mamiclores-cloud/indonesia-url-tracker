@@ -12,7 +12,10 @@ CREATE TABLE IF NOT EXISTS products (
   code TEXT PRIMARY KEY,
   item_name TEXT,
   baseline_override_idr INTEGER,
+  baseline_idr INTEGER,
   high_cost_pct REAL,
+  search_keyword TEXT,
+  search_keyword_at TEXT,
   updated_at TEXT
 );
 
@@ -34,7 +37,11 @@ CREATE TABLE IF NOT EXISTS links (
   status TEXT DEFAULT 'unchecked',
   status_detail TEXT,
   last_price_idr INTEGER,
+  prev_price_idr INTEGER,
   last_checked_at TEXT,
+  shop_location TEXT,
+  sold INTEGER,
+  search_keyword TEXT,
   origin TEXT DEFAULT 'sheet',
   active INTEGER DEFAULT 1,
   UNIQUE(product_code, raw_url)
@@ -95,6 +102,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   tier INTEGER,
   state TEXT NOT NULL DEFAULT 'proposed',
   note TEXT,
+  search_keyword TEXT,
   created_at TEXT
 );
 
@@ -126,9 +134,36 @@ def conn() -> sqlite3.Connection:
     return c
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS won't touch
+# an existing table, so pre-existing DBs get them via ALTER TABLE here.
+MIGRATIONS = [
+    ("links", "prev_price_idr", "INTEGER"),
+    ("links", "shop_location", "TEXT"),
+    ("links", "sold", "INTEGER"),
+    ("links", "search_keyword", "TEXT"),
+    ("products", "baseline_idr", "INTEGER"),
+    ("products", "search_keyword", "TEXT"),
+    ("products", "search_keyword_at", "TEXT"),
+    ("candidates", "search_keyword", "TEXT"),
+]
+
+
+def _migrate(c):
+    for table, col, decl in MIGRATIONS:
+        have = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+        if col not in have:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+    # 客戶 2.1：manual 狀態移除 — 舊資料回到 unchecked，下次檢查重新判定
+    c.execute("UPDATE links SET status='unchecked', status_detail=NULL WHERE status='manual'")
+    # 舊版手動基準（baseline_override_idr）直接沿用為新的固定基準價
+    c.execute("UPDATE products SET baseline_idr=baseline_override_idr "
+              "WHERE baseline_idr IS NULL AND baseline_override_idr IS NOT NULL")
+
+
 def init():
     c = conn()
     c.executescript(SCHEMA)
+    _migrate(c)
     c.commit()
 
 
